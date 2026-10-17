@@ -1,24 +1,36 @@
 name: Release
 
-# Runs on every push to main and by hand. If the tag v<version> from Cargo.toml
-# does not exist yet, builds the app and creates the tag and the release.
+# Runs after CI passed on a push to main (and by hand). If the tag v<version>
+# from Cargo.toml does not exist yet, builds the app from the commit CI checked
+# and creates the tag and the release on that commit.
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-    paths-ignore: ["README.md", "LICENSE"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  # The commit CI checked (workflow_run), or the branch head when run by hand.
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
 jobs:
   check:
+    # Only after a green CI run for a push, never for a pull request or a red run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
       exists: ${{ steps.v.outputs.exists }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
       - id: v
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,6 +53,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
@@ -58,6 +72,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
       - uses: actions/download-artifact@v4
         with:
           name: windows
@@ -72,7 +88,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.check.outputs.version }}
-          SHA: ${{ github.sha }}
         run: |
           cat > notes.md <<'NOTES'
           Download `audio-lite.exe` (Windows 10/11, 64-bit). `SHA256SUMS` has its checksum.
