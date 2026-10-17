@@ -1,8 +1,8 @@
 [package]
 name = "audio-lite"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Tiny Windows tray app: one hotkey cycles the default audio playback device."
+description = "Tiny Windows tray app: one hotkey cycles the default audio playback device, plus a volume mixer."
 license = "MIT"
 repository = "https://github.com/ShelaShelby/Audio-Lite"
 
@@ -20,9 +20,12 @@ features = [
     "implement",
     "Win32_Foundation",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_Debug",

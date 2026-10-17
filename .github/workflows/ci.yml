@@ -29,3 +29,5 @@ jobs:
           size=$(wc -c < target/release/audio-lite.exe)
           echo "audio-lite.exe: $size bytes"
           echo "### Binary size: $size bytes" >> "$GITHUB_STEP_SUMMARY"
+          # The app must stay small.
+          [ "$size" -lt 409600 ] || { echo "audio-lite.exe is 400 KB or more"; exit 1; }

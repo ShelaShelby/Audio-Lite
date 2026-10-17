@@ -6,7 +6,10 @@
 
 mod cycle;
 mod icon;
+mod layout;
+mod mixer;
 mod settings;
+mod volume;
 
 #[cfg(windows)]
 mod app;
@@ -14,6 +17,8 @@ mod app;
 mod audio;
 #[cfg(windows)]
 mod autostart;
+#[cfg(windows)]
+mod popup;
 
 #[cfg(windows)]
 fn main() {
