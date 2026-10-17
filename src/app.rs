@@ -37,8 +37,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const HOTKEY_ID: i32 = 1;
 /// From the audio thread: the model changed (update the tooltip).
 const WM_MODEL: u32 = WM_APP + 1;
-/// While the window is open, read the audio state again this often.
-const SYNC_EVERY: Duration = Duration::from_millis(500);
+/// While the window is open, read the volumes again this often, for anything
+/// the change events missed. Changes made elsewhere normally come as events.
+const POLL_EVERY: Duration = Duration::from_secs(3);
 /// Gap between the window and the screen edge (and the taskbar).
 const EDGE: i32 = 8;
 
@@ -114,6 +115,14 @@ fn model_changed() {
     unsafe {
         let _ = PostMessageW(msg_hwnd(), WM_MODEL, WPARAM(0), LPARAM(0));
     }
+    // Nothing is drawn while the window is hidden.
+    if window_visible() {
+        repaint();
+    }
+}
+
+/// Called on the audio thread after a volume or mute changed elsewhere.
+fn values_changed() {
     // Nothing is drawn while the window is hidden.
     if window_visible() {
         repaint();
@@ -235,6 +244,7 @@ fn show_window() {
         repaint();
         return;
     }
+    engine().set_live(true);
     engine().refresh();
     with_prefs(|p| p.startup = autostart::enabled());
     // Cloaked while it appears, uncloaked after one painted frame, so the
@@ -264,6 +274,7 @@ fn hide_window() {
     unsafe {
         let _ = ShowWindow(hwnd(), SW_HIDE);
     }
+    engine().set_live(false);
     // A hotkey change left half done: put the old hotkey back.
     with_prefs(|p| {
         if p.registered.is_none() {
@@ -429,7 +440,7 @@ struct AudioApp {
     ui: ui::UiState,
     /// True once the window has had focus since it was opened.
     armed: bool,
-    last_sync: Option<Instant>,
+    last_poll: Option<Instant>,
 }
 
 impl AudioApp {
@@ -500,7 +511,7 @@ impl eframe::App for AudioApp {
         if JUST_OPENED.swap(false, Ordering::Relaxed) {
             self.ui.reset();
             self.armed = false; // focus must be seen again before click-away can hide
-            self.last_sync = Some(Instant::now());
+            self.last_poll = Some(Instant::now());
         }
 
         if !window_visible() {
@@ -509,15 +520,16 @@ impl eframe::App for AudioApp {
         // The height may have changed: keep the bottom edge above the taskbar.
         place_window();
 
-        // While open, follow changes made elsewhere twice a second.
+        // Changes made elsewhere come as events; this slow poll of the volumes
+        // only catches what they missed.
         let now = Instant::now();
-        let since = self.last_sync.map_or(SYNC_EVERY, |t| now - t);
-        if since >= SYNC_EVERY {
-            self.last_sync = Some(now);
-            engine().refresh();
-            ctx.request_repaint_after(SYNC_EVERY);
+        let since = self.last_poll.map_or(POLL_EVERY, |t| now - t);
+        if since >= POLL_EVERY {
+            self.last_poll = Some(now);
+            engine().poll();
+            ctx.request_repaint_after(POLL_EVERY);
         } else {
-            ctx.request_repaint_after(SYNC_EVERY - since);
+            ctx.request_repaint_after(POLL_EVERY - since);
         }
 
         // Click-away: hide when focus is lost. A mouse button still held down
@@ -687,7 +699,7 @@ pub fn run() {
     };
 
     // Starts the audio thread; the first read runs in the background.
-    let _ = ENGINE.set(Engine::start(model_changed));
+    let _ = ENGINE.set(Engine::start(model_changed, values_changed));
 
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
@@ -759,7 +771,7 @@ pub fn run() {
             if let Some(n) = cycle_test {
                 start_cycle_test(n);
             }
-            Ok(Box::new(AudioApp { ui: ui::UiState::default(), armed: false, last_sync: None }))
+            Ok(Box::new(AudioApp { ui: ui::UiState::default(), armed: false, last_poll: None }))
         }),
     );
     if let Err(e) = result {

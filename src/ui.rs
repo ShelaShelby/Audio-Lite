@@ -26,8 +26,6 @@ const HOVER: Color32 = Color32::from_rgb(0x27, 0x2b, 0x33);
 const SELECTED: Color32 = Color32::from_rgb(0x22, 0x30, 0x4a);
 const RADIUS: u8 = 8;
 const MARGIN: i8 = 14;
-/// Volume steps per mouse wheel notch.
-const WHEEL_STEP: i32 = 2;
 
 /// What the user did this frame.
 pub enum Action {
@@ -61,8 +59,6 @@ pub struct UiState {
     pub recording: bool,
     /// Why the last recorded combination was refused.
     record_error: Option<&'static str>,
-    /// Mouse wheel notches not turned into a step yet.
-    wheel_rest: f32,
     bottom_h: f32,
     last_height: f32,
 }
@@ -73,7 +69,6 @@ impl UiState {
         self.drag = None;
         self.recording = false;
         self.record_error = None;
-        self.wheel_rest = 0.0;
     }
 
     pub fn dragging(&self) -> bool {
@@ -205,32 +200,6 @@ fn mute_button(ui: &mut egui::Ui, muted: bool) -> egui::Response {
     resp
 }
 
-/// Whole mouse wheel notches turned over `rect` this frame (up is positive).
-/// The wheel then does not scroll the window.
-fn wheel_notches(ui: &mut egui::Ui, st: &mut UiState, rect: egui::Rect) -> i32 {
-    if !ui.rect_contains_pointer(rect) {
-        return 0;
-    }
-    let delta: f32 = ui.input(|i| {
-        i.events
-            .iter()
-            .map(|e| match e {
-                egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                    egui::MouseWheelUnit::Line => delta.y,
-                    egui::MouseWheelUnit::Point => delta.y / 50.0,
-                    egui::MouseWheelUnit::Page => delta.y * 3.0,
-                },
-                _ => 0.0,
-            })
-            .sum()
-    });
-    ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
-    st.wheel_rest += delta;
-    let whole = st.wheel_rest.trunc();
-    st.wheel_rest -= whole;
-    whole as i32
-}
-
 /// Name and number, then the slider and the mute button.
 fn volume_row(
     ui: &mut egui::Ui,
@@ -245,7 +214,6 @@ fn volume_row(
         Some((d, v)) if *d == t => *v,
         _ => level * 100.0,
     };
-    let top = ui.cursor().min;
     ui.horizontal(|ui| {
         let caption = RichText::new(name).color(if t == Target::Master { TEXT } else { MUTED });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -255,6 +223,8 @@ fn volume_row(
     });
     ui.horizontal(|ui| {
         ui.spacing_mut().slider_width = ui.available_width() - 32.0 - ui.spacing().item_spacing.x;
+        // egui's Slider ignores the mouse wheel, so the wheel always scrolls the
+        // window, also over a slider or a mute button.
         let resp = ui.add(Slider::new(&mut v, 0.0..=100.0).show_value(false).trailing_fill(true));
         if resp.dragged() {
             st.drag = Some((t.clone(), v));
@@ -270,14 +240,6 @@ fn volume_row(
             out.push(Action::Mute(t.clone(), !muted));
         }
     });
-    let rect = egui::Rect::from_min_max(top, egui::pos2(ui.max_rect().right(), ui.cursor().min.y));
-    if !st.dragging() {
-        let n = wheel_notches(ui, st, rect);
-        if n != 0 {
-            let p = volume::step(volume::to_percent(v / 100.0), n * WHEEL_STEP);
-            out.push(Action::Volume(t, volume::to_scalar(p as i32), true));
-        }
-    }
 }
 
 fn output_card(ui: &mut egui::Ui, model: &Model, info: &Info, out: &mut Vec<Action>) {

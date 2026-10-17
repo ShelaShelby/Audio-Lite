@@ -2,20 +2,30 @@
 //! for Windows audio: the window reads a copy of `Model` and leaves requests
 //! here. Volume requests are coalesced (latest wins, about 60 writes a second,
 //! see `coalesce`); everything else runs in the order it was asked for.
+//!
+//! Changes made elsewhere (media keys, a headset wheel, other apps) come as
+//! Windows events while the window is open. The callbacks only leave a request
+//! here; the audio thread reads the new values and asks for one redraw.
 
-use crate::audio;
+use crate::audio::{self, Handle};
 use crate::coalesce::{self, Coalescer};
 use crate::cycle::{self, Device};
 use crate::mixer::{self, Row};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
-use windows::core::{implement, Result as WinResult, PCWSTR};
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-use windows::Win32::Media::Audio::{
-    eConsole, eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
-    IMMNotificationClient_Impl, ISimpleAudioVolume, DEVICE_STATE,
+use windows::core::{implement, Result as WinResult, GUID, PCWSTR};
+use windows::Win32::Foundation::BOOL;
+use windows::Win32::Media::Audio::Endpoints::{
+    IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::Media::Audio::{
+    eConsole, eRender, AudioSessionDisconnectReason, AudioSessionState, AudioSessionStateExpired, EDataFlow, ERole,
+    IAudioSessionControl, IAudioSessionEvents, IAudioSessionEvents_Impl, IAudioSessionManager2,
+    IAudioSessionNotification, IAudioSessionNotification_Impl, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
+    IMMNotificationClient_Impl, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE,
+};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::Win32::UI::WindowsAndMessaging::MB_OK;
@@ -29,7 +39,7 @@ pub enum Target {
     App(String),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppLevel {
     pub key: String,
     pub name: String,
@@ -56,6 +66,20 @@ pub struct Model {
 }
 
 impl Model {
+    fn level(&self, t: &Target) -> Option<f32> {
+        match t {
+            Target::Master => self.master.map(|m| m.0),
+            Target::App(k) => self.apps.iter().find(|a| &a.key == k).map(|a| a.volume),
+        }
+    }
+
+    fn muted(&self, t: &Target) -> Option<bool> {
+        match t {
+            Target::Master => self.master.map(|m| m.1),
+            Target::App(k) => self.apps.iter().find(|a| &a.key == k).map(|a| a.muted),
+        }
+    }
+
     fn set_level(&mut self, t: &Target, v: f32) {
         match t {
             Target::Master => {
@@ -89,6 +113,10 @@ impl Model {
 
 enum Cmd {
     Refresh,
+    /// Read the volumes and mutes again (a change event, or the window's safety poll).
+    Values,
+    /// The list of apps changed. Carries the new session when Windows reported one.
+    Sessions(Option<NewSession>),
     SetDefault(String),
     Mute(Target, bool),
     /// The hotkey: go to the next device not in this exclude list, and beep.
@@ -96,9 +124,38 @@ enum Cmd {
     Quit(std::sync::mpsc::Sender<()>),
 }
 
+/// A session Windows reported as new, for the audio thread. Core Audio's session
+/// objects are free-threaded and the audio thread is in the multithreaded
+/// apartment, so the pointer may be used there.
+struct NewSession(IAudioSessionControl);
+// SAFETY: see above; the object is only used on the audio thread.
+unsafe impl Send for NewSession {}
+
 struct Inbox {
     volumes: Coalescer<Target>,
     cmds: Vec<Cmd>,
+    /// The slider being dragged. Change events leave it alone and no full
+    /// refresh runs until it is let go.
+    held: Option<Target>,
+}
+
+impl Inbox {
+    /// The user owns these values right now (a slider being dragged, a volume or
+    /// mute not written yet): keep the window's values from `old` for them.
+    fn keep_user_values(&self, old: &Model, new: &mut Model) {
+        for t in self.volumes.pending().iter().map(|(t, _)| t).chain(&self.held) {
+            if let Some(v) = old.level(t) {
+                new.set_level(t, v);
+            }
+        }
+        for c in &self.cmds {
+            if let Cmd::Mute(t, _) = c {
+                if let Some(on) = old.muted(t) {
+                    new.set_muted(t, on);
+                }
+            }
+        }
+    }
 }
 
 pub struct Engine {
@@ -107,6 +164,11 @@ pub struct Engine {
     wake: Condvar,
     /// Called on the audio thread after the model changed.
     changed: fn(),
+    /// Called on the audio thread after only volumes or mutes changed.
+    redraw: fn(),
+    /// The window is open: follow change events. While it is closed they are
+    /// ignored (opening it reads everything again).
+    live: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -115,12 +177,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Engine {
     /// Start the audio thread. It reads everything once right away.
-    pub fn start(changed: fn()) -> Arc<Engine> {
+    pub fn start(changed: fn(), redraw: fn()) -> Arc<Engine> {
         let engine = Arc::new(Engine {
             model: Mutex::new(Model::default()),
-            inbox: Mutex::new(Inbox { volumes: Coalescer::new(coalesce::GAP), cmds: vec![Cmd::Refresh] }),
+            inbox: Mutex::new(Inbox { volumes: Coalescer::new(coalesce::GAP), cmds: vec![Cmd::Refresh], held: None }),
             wake: Condvar::new(),
             changed,
+            redraw,
+            live: AtomicBool::new(false),
         });
         let e = engine.clone();
         std::thread::spawn(move || run(e));
@@ -134,15 +198,42 @@ impl Engine {
 
     fn send(&self, cmd: Cmd) {
         let mut inbox = lock(&self.inbox);
-        // One waiting refresh is enough.
-        if !(matches!(cmd, Cmd::Refresh) && inbox.cmds.iter().any(|c| matches!(c, Cmd::Refresh))) {
+        // One waiting refresh (or read of the values, or of the app list) is enough.
+        let same = |c: &Cmd| {
+            matches!(
+                (&cmd, c),
+                (Cmd::Refresh, Cmd::Refresh) | (Cmd::Values, Cmd::Values) | (Cmd::Sessions(None), Cmd::Sessions(_))
+            )
+        };
+        if !inbox.cmds.iter().any(same) {
             inbox.cmds.push(cmd);
         }
         self.wake.notify_one();
     }
 
+    /// From a Windows callback: never blocks for long, never calls Windows audio.
+    fn event(&self, cmd: impl FnOnce() -> Cmd) {
+        if self.live.load(Ordering::Relaxed) {
+            self.send(cmd());
+        }
+    }
+
     pub fn refresh(&self) {
         self.send(Cmd::Refresh);
+    }
+
+    /// Read only the volumes and mutes again (cheap; the window's safety poll).
+    pub fn poll(&self) {
+        self.send(Cmd::Values);
+    }
+
+    /// The window was opened (true) or closed (false). Closing also ends a drag.
+    pub fn set_live(&self, on: bool) {
+        self.live.store(on, Ordering::Relaxed);
+        if !on {
+            lock(&self.inbox).held = None;
+            self.wake.notify_one();
+        }
     }
 
     pub fn set_default(&self, id: String) {
@@ -155,22 +246,28 @@ impl Engine {
     }
 
     /// Ask for a volume (0.0-1.0). Only the newest value per target is written.
-    /// `last` (slider let go, click, wheel) writes it without waiting.
+    /// `last` (slider let go, click on the track, arrow key) writes it without
+    /// waiting and ends the drag; otherwise the slider is being dragged.
     pub fn set_volume(&self, t: Target, v: f32, last: bool) {
         let v = v.clamp(0.0, 1.0);
-        lock(&self.model).set_level(&t, v);
+        // Model and inbox change together, so a read of the values never sees one without the other.
         let mut inbox = lock(&self.inbox);
+        lock(&self.model).set_level(&t, v);
         if last {
+            inbox.held = None;
             inbox.volumes.set_final(t, v);
         } else {
+            inbox.held = Some(t.clone());
             inbox.volumes.set(t, v);
         }
         self.wake.notify_one();
     }
 
     pub fn set_mute(&self, t: Target, on: bool) {
+        let mut inbox = lock(&self.inbox);
         lock(&self.model).set_muted(&t, on);
-        self.send(Cmd::Mute(t, on));
+        inbox.cmds.push(Cmd::Mute(t, on));
+        self.wake.notify_one();
     }
 
     /// Stop the audio thread (it lets go of its audio objects), waiting at most 2 s.
@@ -209,14 +306,98 @@ impl IMMNotificationClient_Impl for Notifier_Impl {
     }
 }
 
+/// The default device's master volume or mute changed.
+#[implement(IAudioEndpointVolumeCallback)]
+struct MasterEvents {
+    engine: Arc<Engine>,
+}
+
+impl IAudioEndpointVolumeCallback_Impl for MasterEvents_Impl {
+    fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> WinResult<()> {
+        // The app's own changes are already in the model.
+        let own = !data.is_null() && unsafe { (*data).guidEventContext } == audio::APP_CONTEXT;
+        if !own {
+            self.engine.event(|| Cmd::Values);
+        }
+        Ok(())
+    }
+}
+
+/// An app started sound on the default device.
+#[implement(IAudioSessionNotification)]
+struct NewSessions {
+    engine: Arc<Engine>,
+}
+
+impl IAudioSessionNotification_Impl for NewSessions_Impl {
+    fn OnSessionCreated(&self, session: Option<&IAudioSessionControl>) -> WinResult<()> {
+        self.engine.event(|| Cmd::Sessions(session.cloned().map(NewSession)));
+        Ok(())
+    }
+}
+
+/// One object for every session: an app's volume or mute changed, or it ended.
+#[implement(IAudioSessionEvents)]
+struct AppEvents {
+    engine: Arc<Engine>,
+}
+
+impl IAudioSessionEvents_Impl for AppEvents_Impl {
+    fn OnDisplayNameChanged(&self, _: &PCWSTR, _: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+    fn OnIconPathChanged(&self, _: &PCWSTR, _: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+    fn OnSimpleVolumeChanged(&self, _: f32, _: BOOL, context: *const GUID) -> WinResult<()> {
+        if !audio::is_own(context) {
+            self.engine.event(|| Cmd::Values);
+        }
+        Ok(())
+    }
+    fn OnChannelVolumeChanged(&self, _: u32, _: *const f32, _: u32, _: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+    fn OnGroupingParamChanged(&self, _: *const GUID, _: *const GUID) -> WinResult<()> {
+        Ok(())
+    }
+    fn OnStateChanged(&self, state: AudioSessionState) -> WinResult<()> {
+        if state == AudioSessionStateExpired {
+            self.engine.event(|| Cmd::Sessions(None));
+        }
+        Ok(())
+    }
+    fn OnSessionDisconnected(&self, _: AudioSessionDisconnectReason) -> WinResult<()> {
+        self.engine.event(|| Cmd::Sessions(None));
+        Ok(())
+    }
+}
+
+/// The callback objects, made once and registered again for every new device.
+struct Callbacks {
+    master: IAudioEndpointVolumeCallback,
+    sessions: IAudioSessionNotification,
+    app: IAudioSessionEvents,
+}
+
 /// The audio objects, only ever used on the audio thread.
 struct Audio {
     engine: Arc<Engine>,
     enumerator: Option<IMMDeviceEnumerator>,
     device: Option<IMMDevice>,
     master: Option<IAudioEndpointVolume>,
-    rows: Vec<Row<ISimpleAudioVolume>>,
+    manager: Option<IAudioSessionManager2>,
+    rows: Vec<Row<Handle>>,
+    /// Sessions Windows reported as new. Its session list may not have them yet.
+    new_sessions: Vec<IAudioSessionControl>,
     names: audio::NameCache,
+    callbacks: Callbacks,
+    /// Where the callbacks are registered now, to unregister them again.
+    master_watched: bool,
+    sessions_watched: bool,
+    apps_watched: Vec<IAudioSessionControl>,
+    /// A refresh asked for while a slider was dragged; it runs when it is let go.
+    deferred: bool,
 }
 
 impl Audio {
@@ -230,7 +411,7 @@ impl Audio {
             Target::App(k) => {
                 if let Some(r) = self.rows.iter_mut().find(|r| &r.key == k) {
                     for h in &r.handles {
-                        audio::set_session_volume(h, v);
+                        audio::set_session_volume(&h.volume, v);
                     }
                     r.volume = v;
                 }
@@ -248,7 +429,7 @@ impl Audio {
             Target::App(k) => {
                 if let Some(r) = self.rows.iter_mut().find(|r| &r.key == k) {
                     for h in &r.handles {
-                        audio::set_session_mute(h, on);
+                        audio::set_session_mute(&h.volume, on);
                     }
                     r.muted = on;
                 }
@@ -256,11 +437,65 @@ impl Audio {
         }
     }
 
+    fn watch_apps(&mut self) {
+        for h in self.rows.iter().flat_map(|r| &r.handles) {
+            if unsafe { h.control.RegisterAudioSessionNotification(&self.callbacks.app) }.is_ok() {
+                self.apps_watched.push(h.control.clone());
+            }
+        }
+    }
+
+    fn unwatch_apps(&mut self) {
+        for c in self.apps_watched.drain(..) {
+            unsafe {
+                let _ = c.UnregisterAudioSessionNotification(&self.callbacks.app);
+            }
+        }
+    }
+
+    /// Register the change events on the current device, its master volume and its apps.
+    fn watch(&mut self) {
+        unsafe {
+            if let Some(m) = &self.master {
+                self.master_watched = m.RegisterControlChangeNotify(&self.callbacks.master).is_ok();
+            }
+            if let Some(mgr) = &self.manager {
+                self.sessions_watched = mgr.RegisterSessionNotification(&self.callbacks.sessions).is_ok();
+            }
+        }
+        self.watch_apps();
+    }
+
+    fn unwatch(&mut self) {
+        unsafe {
+            if let Some(m) = self.master.as_ref().filter(|_| self.master_watched) {
+                let _ = m.UnregisterControlChangeNotify(&self.callbacks.master);
+            }
+            if let Some(mgr) = self.manager.as_ref().filter(|_| self.sessions_watched) {
+                let _ = mgr.UnregisterSessionNotification(&self.callbacks.sessions);
+            }
+        }
+        self.master_watched = false;
+        self.sessions_watched = false;
+        self.unwatch_apps();
+    }
+
+    fn app_levels(&self) -> Vec<AppLevel> {
+        self.rows
+            .iter()
+            .map(|r| AppLevel { key: r.key.clone(), name: r.name.clone(), volume: r.volume, muted: r.muted })
+            .collect()
+    }
+
     /// Read everything again: devices, the default one, its volume and its apps.
+    /// The change events are registered again on what was read.
     fn refresh(&mut self, note: Option<Option<String>>) {
+        self.unwatch();
         let mut m = Model::default();
         self.device = None;
         self.master = None;
+        self.manager = None;
+        self.new_sessions.clear();
         let old_rows = std::mem::take(&mut self.rows);
         match &self.enumerator {
             None => m.error = Some("Windows audio is not available".into()),
@@ -278,8 +513,15 @@ impl Audio {
                             Ok(state) => m.master = Some(state),
                             Err(err) => m.error = Some(format!("Could not read the volume: {}", err.message())),
                         }
-                        match audio::sessions(&device, &mut self.names) {
-                            Ok(list) => self.rows = mixer::merge(list),
+                        // The session list is read before the manager is watched,
+                        // otherwise Windows does not report new sessions.
+                        let list = audio::session_manager(&device)
+                            .and_then(|mgr| Ok((audio::sessions(&mgr, &mut self.names)?, mgr)));
+                        match list {
+                            Ok((list, mgr)) => {
+                                self.rows = mixer::merge(list);
+                                self.manager = Some(mgr);
+                            }
                             Err(err) => m.apps_error = Some(format!("Could not read apps: {}", err.message())),
                         }
                         self.device = Some(device);
@@ -297,21 +539,78 @@ impl Audio {
             self.names.retain_rows(&self.rows);
         }
         drop(old_rows);
-        m.apps = self
-            .rows
-            .iter()
-            .map(|r| AppLevel { key: r.key.clone(), name: r.name.clone(), volume: r.volume, muted: r.muted })
-            .collect();
-        // Volumes asked for but not written yet win over what Windows says now.
-        {
-            let inbox = lock(&self.engine.inbox);
-            for (t, v) in inbox.volumes.pending() {
-                m.set_level(t, *v);
-            }
-        }
+        self.watch();
+        m.apps = self.app_levels();
+        let inbox = lock(&self.engine.inbox);
         let mut model = lock(&self.engine.model);
+        inbox.keep_user_values(&model, &mut m);
         m.note = note.unwrap_or_else(|| model.note.take());
         *model = m;
+    }
+
+    /// The list of apps again, without the devices. True if the window has to be redrawn.
+    fn rescan_apps(&mut self) -> bool {
+        let Some(mgr) = &self.manager else { return false };
+        let Ok(mut list) = audio::sessions(mgr, &mut self.names) else { return false };
+        // New sessions the list does not have yet; forget them once it has them or they ended.
+        let names = &mut self.names;
+        self.new_sessions.retain(|c| {
+            let Some(s) = audio::session(c, -1, names) else { return false };
+            let keep = !s.expired && !list.iter().any(|x| x.id == s.id);
+            if keep {
+                list.push(s);
+            }
+            keep
+        });
+        self.unwatch_apps();
+        let old_rows = std::mem::replace(&mut self.rows, mixer::merge(list));
+        if mixer::rows_changed(&old_rows, &self.rows) {
+            self.names.retain_rows(&self.rows);
+        }
+        drop(old_rows);
+        self.watch_apps();
+        let apps = self.app_levels();
+        self.publish(|m| m.apps = apps)
+    }
+
+    /// Volumes and mutes only: no devices, no names. True if one of them changed.
+    fn read_values(&mut self) -> bool {
+        let master = self.master.as_ref().and_then(|m| audio::endpoint_state(m).ok());
+        for r in &mut self.rows {
+            let mut states = r.handles.iter().filter_map(|h| audio::session_state(&h.volume));
+            if let Some((v, first_muted)) = states.next() {
+                r.volume = v;
+                r.muted = first_muted && states.all(|s| s.1);
+            }
+        }
+        let apps = self.app_levels();
+        self.publish(|m| {
+            if master.is_some() {
+                m.master = master;
+            }
+            for a in &mut m.apps {
+                if let Some(n) = apps.iter().find(|n| n.key == a.key) {
+                    a.volume = n.volume;
+                    a.muted = n.muted;
+                }
+            }
+            if m.apps.len() != apps.len() {
+                m.apps = apps;
+            }
+        })
+    }
+
+    /// Change the model's volumes and apps, keeping what the user owns right
+    /// now. True if anything the window shows changed.
+    fn publish(&self, f: impl FnOnce(&mut Model)) -> bool {
+        let inbox = lock(&self.engine.inbox);
+        let mut model = lock(&self.engine.model);
+        let mut m = model.clone();
+        f(&mut m);
+        inbox.keep_user_values(&model, &mut m);
+        let changed = m.master != model.master || m.apps != model.apps;
+        *model = m;
+        changed
     }
 
     fn switch_to(&mut self, id: &str) -> Option<String> {
@@ -335,8 +634,9 @@ impl Audio {
 }
 
 fn run(engine: Arc<Engine>) {
+    // Multithreaded: Windows only reports new audio sessions to such threads.
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let enumerator = audio::enumerator().ok();
     let notifier: Option<IMMNotificationClient> =
@@ -346,21 +646,34 @@ fn run(engine: Arc<Engine>) {
             let _ = e.RegisterEndpointNotificationCallback(n);
         }
     }
+    let callbacks = Callbacks {
+        master: MasterEvents { engine: engine.clone() }.into(),
+        sessions: NewSessions { engine: engine.clone() }.into(),
+        app: AppEvents { engine: engine.clone() }.into(),
+    };
     let mut a = Audio {
         engine: engine.clone(),
         enumerator,
         device: None,
         master: None,
+        manager: None,
         rows: Vec::new(),
+        new_sessions: Vec::new(),
         names: audio::NameCache::default(),
+        callbacks,
+        master_watched: false,
+        sessions_watched: false,
+        apps_watched: Vec::new(),
+        deferred: false,
     };
     loop {
-        let (cmds, volumes) = {
+        let (cmds, volumes, held) = {
             let mut inbox = lock(&engine.inbox);
             loop {
                 let now = Instant::now();
                 let due = inbox.volumes.due(now);
-                if !inbox.cmds.is_empty() || due.is_some_and(|t| t <= now) {
+                let deferred_ready = a.deferred && inbox.held.is_none();
+                if !inbox.cmds.is_empty() || due.is_some_and(|t| t <= now) || deferred_ready {
                     break;
                 }
                 inbox = match due {
@@ -368,18 +681,25 @@ fn run(engine: Arc<Engine>) {
                     None => engine.wake.wait(inbox).unwrap_or_else(|e| e.into_inner()),
                 };
             }
-            (std::mem::take(&mut inbox.cmds), inbox.volumes.take(Instant::now()))
+            (std::mem::take(&mut inbox.cmds), inbox.volumes.take(Instant::now()), inbox.held.is_some())
         };
         // No lock is held while Windows audio is called.
         for (t, v) in &volumes {
             a.write_volume(t, *v);
         }
-        let mut refresh = false;
+        let mut refresh = std::mem::take(&mut a.deferred);
+        let mut values = false;
+        let mut apps = false;
         // Some(..): the result of a switch, shown until the next one.
         let mut note = None;
         for cmd in cmds {
             match cmd {
                 Cmd::Refresh => refresh = true,
+                Cmd::Values => values = true,
+                Cmd::Sessions(new) => {
+                    a.new_sessions.extend(new.map(|n| n.0));
+                    apps = true;
+                }
                 Cmd::Mute(t, on) => a.write_mute(&t, on),
                 Cmd::SetDefault(id) => {
                     note = Some(a.switch_to(&id));
@@ -392,6 +712,7 @@ fn run(engine: Arc<Engine>) {
                     }
                 }
                 Cmd::Quit(done) => {
+                    a.unwatch();
                     if let (Some(e), Some(n)) = (&a.enumerator, &notifier) {
                         unsafe {
                             let _ = e.UnregisterEndpointNotificationCallback(n);
@@ -405,10 +726,25 @@ fn run(engine: Arc<Engine>) {
                 }
             }
         }
+        // Never a full refresh while a slider is dragged: it runs when it is let go.
+        if refresh && held {
+            if let Some(n) = note.take() {
+                lock(&engine.model).note = n;
+                (engine.changed)();
+            }
+            a.deferred = true;
+            refresh = false;
+        }
         // Volume writes need no repaint: the window already shows those values.
         if refresh {
             a.refresh(note);
             (engine.changed)();
+        } else {
+            let mut redraw = apps && a.rescan_apps();
+            redraw |= values && a.read_values();
+            if redraw {
+                (engine.redraw)();
+            }
         }
     }
 }
