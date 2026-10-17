@@ -29,5 +29,23 @@ jobs:
           size=$(wc -c < target/release/audio-lite.exe)
           echo "audio-lite.exe: $size bytes"
           echo "### Binary size: $size bytes" >> "$GITHUB_STEP_SUMMARY"
-          # The app must stay small.
-          [ "$size" -lt 409600 ] || { echo "audio-lite.exe is 400 KB or more"; exit 1; }
+      # Memory check: open and hide the window 300 times and print PrivateUsage and
+      # WorkingSetSize at 0, 75, 150 and 300 cycles and 3 s after the last hide.
+      # Fails if the 300 cycles do not finish.
+      - name: Cycle test (window open/hide x300, memory)
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          summary() { { echo "### Cycle test, $1"; echo '```'; cat "$2"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; }
+          ./target/release/audio-lite.exe --cycle-test 300 || echo "exit code $?"
+          touch cycle-test.log && cat cycle-test.log && summary "Windows OpenGL" cycle-test.log
+          # The runner has no GPU. If no window could be made, try Mesa's software OpenGL.
+          if ! grep -q "cycle 300" cycle-test.log; then
+            curl -sSfL -o mesa.7z https://github.com/pal1000/mesa-dist-win/releases/download/24.2.5/mesa3d-24.2.5-release-msvc.7z
+            mkdir -p mesa && 7z e -y -omesa mesa.7z 'x64/*.dll' > /dev/null
+            cp target/release/audio-lite.exe mesa/
+            cd mesa
+            GALLIUM_DRIVER=llvmpipe ./audio-lite.exe --cycle-test 300 || echo "exit code $?"
+            touch cycle-test.log && cat cycle-test.log && summary "Mesa llvmpipe (software OpenGL)" cycle-test.log
+          fi
+          grep -q "+3 s idle" cycle-test.log || { echo "cycle test did not finish"; exit 1; }

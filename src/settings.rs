@@ -13,7 +13,7 @@ pub const DEFAULT_HOTKEY: &str = "Ctrl+Alt+A";
 pub struct Settings {
     /// For example "Ctrl+Alt+A".
     pub hotkey: String,
-    /// Device names the hotkey skips (they stay in the tray menu).
+    /// Device names the hotkey skips (unticked "In hotkey cycle" in the window).
     pub exclude: Vec<String>,
 }
 
@@ -30,6 +30,15 @@ pub fn parse(text: Option<&str>) -> Settings {
 
 pub fn to_json(s: &Settings) -> String {
     serde_json::to_string_pretty(s).unwrap_or_default() + "\n"
+}
+
+/// Write the file, making its folder if needed. Only called after the user
+/// changed something in the window.
+pub fn save(path: &Path, s: &Settings) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, to_json(s))
 }
 
 /// Where the file lives: next to the exe if a settings.json is already there
@@ -129,6 +138,16 @@ mod tests {
     fn round_trip() {
         let s = Settings { hotkey: "Win+F2".into(), exclude: vec!["A".into()] };
         assert_eq!(parse(Some(&to_json(&s))), s);
+    }
+
+    #[test]
+    fn save_makes_the_folder_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!("audio-lite-test-{}", std::process::id()));
+        let path = dir.join(APP_DIR).join(FILE_NAME);
+        let s = Settings { hotkey: "Ctrl+Shift+F9".into(), exclude: vec!["TV".into()] };
+        save(&path, &s).unwrap();
+        assert_eq!(parse(std::fs::read_to_string(&path).ok().as_deref()), s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

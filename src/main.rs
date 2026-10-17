@@ -1,12 +1,14 @@
-//! Audio Lite: a tray icon and one hotkey that cycles the default playback device.
+//! Audio Lite: a tray app with one window to pick the playback device and set
+//! the volumes, and one hotkey that cycles the default playback device.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 // The pure modules are only used by the Windows code outside of tests.
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod coalesce;
 mod cycle;
+mod hotkey;
 mod icon;
-mod layout;
 mod mixer;
 mod settings;
 mod volume;
@@ -18,7 +20,9 @@ mod audio;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
-mod popup;
+mod engine;
+#[cfg(windows)]
+mod ui;
 
 #[cfg(windows)]
 fn main() {
