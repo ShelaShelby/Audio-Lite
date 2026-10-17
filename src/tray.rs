@@ -13,17 +13,19 @@ use crate::args::{self, WindowArgs};
 use crate::lifetime::Ask;
 use crate::proto::{self, HotkeyStatus};
 use crate::settings::{self, Settings};
-use crate::{audio, autostart, cycle, icon};
+use crate::{audio, autostart, cycle, icon, tooltip};
 use std::cell::RefCell;
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::{implement, w, Result as WinResult, PCWSTR, PWSTR};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0,
-    WAIT_TIMEOUT, WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Media::Audio::{
     eConsole, eRender, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
@@ -33,20 +35,20 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::{
-    GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    GetProcessMemoryInfo, K32EmptyWorkingSet, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
 };
 use windows::Win32::System::Threading::{
-    CreateMutexW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId, WaitForSingleObject, INFINITE,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateMutexW, CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetProcessHandleCount, TerminateProcess,
+    WaitForSingleObject, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT};
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW, MsgWaitForMultipleObjectsEx,
-    PeekMessageW, PostMessageW, RegisterClassW, SendMessageTimeoutW, TranslateMessage, HWND_MESSAGE, MB_OK, MSG,
-    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG, WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WNDCLASSW,
-    WS_OVERLAPPED,
+    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW, KillTimer,
+    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, RegisterClassW, SendMessageTimeoutW, SetTimer,
+    TranslateMessage, HWND_MESSAGE, MB_OK, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG,
+    WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const HOTKEY_ID: i32 = 1;
@@ -57,6 +59,10 @@ const ASK_TIMEOUT_MS: u32 = 3000;
 /// Never more window processes than this at once (normally one; two for a
 /// moment while an old one exits).
 const MAX_CHILDREN: usize = 4;
+/// Gives the tray's idle memory back to Windows: 2 s after the start and 2 s
+/// after the last window process exited (pages it needs again come back by themselves).
+const TRIM_TIMER: usize = 2;
+const TRIM_AFTER_MS: u32 = 2000;
 
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -84,6 +90,7 @@ struct Tray {
     no_hotkey: bool,
     /// The last switching problem, until the next switch works.
     note: Option<String>,
+    /// The tooltip Windows has now (the last one it took).
     tooltip: String,
     enumerator: Option<IMMDeviceEnumerator>,
     /// The newest one last.
@@ -110,9 +117,27 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn read_settings(path: Option<&PathBuf>) -> Settings {
-    let text = path.and_then(|p| std::fs::read_to_string(p).ok());
-    settings::parse(text.as_deref())
+/// None: the file is there but could not be read right now (keep what is in use).
+fn read_settings(path: Option<&PathBuf>) -> Option<Settings> {
+    let text = settings::read(path.map(PathBuf::as_path)).ok()?;
+    Some(settings::parse(text.as_deref()))
+}
+
+/// Give the pages the tray does not touch while idle back to Windows (Task
+/// Manager's memory column). They are read back from memory if needed.
+fn trim_memory() {
+    unsafe {
+        let _ = K32EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+fn arm_trim() {
+    // Without the message window the timer would have nowhere to go.
+    if !msg_hwnd().0.is_null() {
+        unsafe {
+            SetTimer(msg_hwnd(), TRIM_TIMER, TRIM_AFTER_MS, None);
+        }
+    }
 }
 
 impl Tray {
@@ -141,6 +166,17 @@ impl Tray {
         self.register(&text);
     }
 
+    /// The hotkey was taken by another program (at the start, or after a
+    /// change): try again, it may be free now. Called when the window opens.
+    fn retry_hotkey(&mut self) {
+        if !self.no_hotkey && !self.paused && self.registered.is_none() {
+            self.register_saved();
+            if self.registered.is_some() {
+                self.update_tooltip();
+            }
+        }
+    }
+
     fn status(&self) -> HotkeyStatus {
         HotkeyStatus {
             unknown: proto::wanted_hotkey(&self.settings.hotkey).1,
@@ -153,7 +189,8 @@ impl Tray {
     /// The window wrote settings.json. A new hotkey is kept only if Windows
     /// takes it; otherwise the one before stays and the answer says `refused`.
     fn reload(&mut self) -> HotkeyStatus {
-        let new = read_settings(self.path.as_ref());
+        // Not readable right now: keep the settings in use rather than the defaults.
+        let Some(new) = read_settings(self.path.as_ref()) else { return self.status() };
         self.settings.exclude = new.exclude;
         let mut refused = false;
         if new.hotkey != self.settings.hotkey {
@@ -185,23 +222,22 @@ impl Tray {
 
     fn update_tooltip(&mut self) {
         let name = self.enumerator.as_ref().and_then(audio::default_device).map(|d| d.name);
-        let mut tip = format!("Audio Lite: {}", name.as_deref().unwrap_or("No playback device"));
+        let first = format!("Audio Lite: {}", name.as_deref().unwrap_or("No playback device"));
         let hotkey_error = if self.no_hotkey {
             Some("The hotkey could not be set up.".to_string())
         } else {
             proto::hotkey_view(&self.settings.hotkey, Some(self.status())).1
         };
-        for n in self.note.iter().chain(&hotkey_error) {
-            tip.push('\n');
-            tip.push_str(n);
-        }
+        let rest: Vec<&str> = self.note.iter().chain(&hotkey_error).map(String::as_str).collect();
+        let tip = tooltip::text(&first, &rest);
         if tip != self.tooltip {
-            ICON.with(|t| {
-                if let Some(t) = t.borrow().as_ref() {
-                    let _ = t.set_tooltip(Some(&tip));
-                }
-            });
-            self.tooltip = tip;
+            // Kept only once Windows took it (it refuses while Explorer is
+            // restarting), so the next update tries again.
+            let ok =
+                ICON.with(|t| t.try_borrow().ok().and_then(|t| t.as_ref().map(|t| t.set_tooltip(Some(&tip)).is_ok())));
+            if ok == Some(true) {
+                self.tooltip = tip;
+            }
         }
     }
 
@@ -228,15 +264,16 @@ impl Tray {
         if self.children.len() >= MAX_CHILDREN {
             return;
         }
-        let Ok(exe) = std::env::current_exe() else { return };
-        let exe = exe.display().to_string();
+        let Ok(exe_path) = std::env::current_exe() else { return };
+        let exe = exe_path.display().to_string();
         let w = WindowArgs {
             parent: unsafe { GetCurrentProcessId() },
             at,
             linger_ms: self.linger_ms,
             no_tray: self.no_tray && !self.testing,
         };
-        let exe_w = wide(&exe);
+        // The exact path (any character a file name may have), not the text form.
+        let exe_w: Vec<u16> = exe_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let mut line = wide(&args::command_line(&exe, &w));
         let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
         let mut pi = PROCESS_INFORMATION::default();
@@ -281,6 +318,7 @@ impl Tray {
             test_event(|l| l.exited += 1);
         }
         if self.children.is_empty() {
+            arm_trim();
             // Closed (or killed) while a new hotkey was recorded: take the saved one again.
             if self.paused {
                 self.register_saved();
@@ -297,6 +335,8 @@ impl Tray {
 /// A tray click (or a step of the cycle test): ask the waiting window process,
 /// or start a new one.
 fn open(ask: Ask, at: Option<(i32, i32)>) {
+    // A tooltip Windows did not take (Explorer was restarting) is set again.
+    with_tray(Tray::update_tooltip);
     let current = with_tray(|t| t.children.last().map(|c| (c.pid, c.hwnd, c.process))).flatten();
     if let Some((pid, hwnd, process)) = current {
         // Still starting: it shows itself when it is ready.
@@ -338,7 +378,8 @@ fn open(ask: Ask, at: Option<(i32, i32)>) {
 
 fn quit(code: i32) -> ! {
     // Removes the tray icon. A window process sees the tray gone and exits by itself.
-    ICON.with(|t| t.borrow_mut().take());
+    let icon = ICON.with(|t| t.try_borrow_mut().ok().and_then(|mut t| t.take()));
+    drop(icon);
     std::process::exit(code);
 }
 
@@ -362,7 +403,13 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         proto::TRAY_RELOAD => LRESULT(with_tray(Tray::reload).map_or(0, proto::encode)),
         proto::TRAY_HOTKEY => LRESULT(with_tray(|t| t.pause(wp.0 == 1)).map_or(0, proto::encode)),
-        proto::TRAY_STATUS => LRESULT(with_tray(|t| t.status()).map_or(0, proto::encode)),
+        proto::TRAY_STATUS => LRESULT(
+            with_tray(|t| {
+                t.retry_hotkey();
+                t.status()
+            })
+            .map_or(0, proto::encode),
+        ),
         proto::TRAY_QUIT => quit(wp.0 as i32),
         proto::TRAY_SHOWN => {
             test_event(|l| if wp.0 == 1 { l.shown += 1 } else { l.hidden += 1 });
@@ -372,8 +419,21 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             match wp.0 {
                 proto::TEST_CLICK => open(Ask::Show, None),
                 proto::TEST_HIDE => open(Ask::Hide, None),
+                proto::TEST_TOGGLE => open(Ask::Toggle, None),
+                proto::TEST_KILL => {
+                    with_tray(|t| {
+                        for c in &t.children {
+                            let _ = TerminateProcess(c.process, 9);
+                        }
+                    });
+                }
                 _ => {}
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == TRIM_TIMER => {
+            let _ = KillTimer(hwnd, TRIM_TIMER);
+            trim_memory();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -441,7 +501,11 @@ impl IMMNotificationClient_Impl for Notifier_Impl {
         }
         Ok(())
     }
-    fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> WinResult<()> {
+    fn OnPropertyValueChanged(&self, _: &PCWSTR, key: &PROPERTYKEY) -> WinResult<()> {
+        // A device was renamed: the tooltip may show its old name.
+        if *key == PKEY_Device_FriendlyName {
+            device_changed();
+        }
         Ok(())
     }
 }
@@ -492,7 +556,7 @@ fn single_instance(name: PCWSTR) -> Option<HANDLE> {
     }
 }
 
-pub fn run(cycle_test: Option<u32>) {
+pub fn run(cycle_test: Option<u32>, stress_test: Option<u32>) {
     // A second copy exits quietly.
     let Some(_instance) = single_instance(w!("Local\\AudioLite-single-instance")) else {
         return;
@@ -525,8 +589,9 @@ pub fn run(cycle_test: Option<u32>) {
             let _ = e.RegisterEndpointNotificationCallback(n);
         }
     }
+    let testing = cycle_test.is_some() || stress_test.is_some();
     let tray = Tray {
-        settings: read_settings(path.as_ref()),
+        settings: read_settings(path.as_ref()).unwrap_or_default(),
         path,
         registered: None,
         paused: false,
@@ -536,8 +601,8 @@ pub fn run(cycle_test: Option<u32>) {
         enumerator,
         children: Vec::new(),
         no_tray: false,
-        linger_ms: cycle_test.map(|_| TEST_LINGER_MS),
-        testing: cycle_test.is_some(),
+        linger_ms: testing.then_some(TEST_LINGER_MS),
+        testing,
     };
     TRAY.with(|t| *t.borrow_mut() = Some(tray));
     if !no_hotkey {
@@ -548,13 +613,15 @@ pub fn run(cycle_test: Option<u32>) {
         t.no_tray = no_tray;
         t.update_tooltip();
     });
-    match cycle_test {
-        Some(n) => start_cycle_test(n),
+    arm_trim();
+    match (cycle_test, stress_test) {
+        (Some(n), _) => start_cycle_test(n),
+        (None, Some(n)) => start_stress_test(n),
         // No tray icon: the window opens at once and stays open.
-        None if no_tray => {
+        (None, None) if no_tray => {
             with_tray(|t| t.start_window(None));
         }
-        None => {}
+        (None, None) => {}
     }
 
     message_loop();
@@ -570,6 +637,13 @@ fn message_loop() {
         let i = r.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
         if let Some(&h) = handles.get(i) {
             with_tray(|t| t.child_exited(h));
+        } else if r == WAIT_FAILED {
+            // Never spin: drop every handle that cannot be waited for any more.
+            for h in handles {
+                if unsafe { WaitForSingleObject(h, 0) } != WAIT_TIMEOUT {
+                    with_tray(|t| t.child_exited(h));
+                }
+            }
         }
         unsafe {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -643,14 +717,23 @@ fn memory_info() -> Option<(usize, usize)> {
     memory_of(unsafe { GetCurrentProcess() })
 }
 
+/// How many handles the tray has open.
+fn handle_count() -> Option<u32> {
+    let mut n = 0;
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }.ok()?;
+    Some(n)
+}
+
 const MB: f64 = 1048576.0;
 
 /// Printed to stdout and appended to cycle-test.log in the current folder
 /// (this is a GUI program, so stdout may go nowhere).
 fn report(line: &str) {
     use std::io::Write;
-    println!("{line}");
-    let _ = std::io::stdout().flush();
+    // Never println!: it panics (and so aborts) if stdout is a closed pipe.
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("cycle-test.log") {
         let _ = writeln!(f, "{line}");
     }
@@ -683,10 +766,14 @@ fn test_end(code: i32, line: &str) -> ! {
 /// waits until the process exited.
 fn start_cycle_test(n: u32) {
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(1));
         report(&format!("cycle-test: {n} cycles of start window process, show, hide, exit"));
+        // The tray trims its memory 2 s after the start: before and after.
+        report_memory("tray start", memory_info());
+        std::thread::sleep(Duration::from_millis(2500));
         let start = memory_info();
         report_memory("tray idle", start);
+        let handles_start = handle_count();
         let marks = [n / 4, n / 2, n];
         let mut reused = 0;
         for c in 1..=n {
@@ -729,11 +816,18 @@ fn start_cycle_test(n: u32) {
                 report_memory(&format!("cycle {c}"), memory_info());
             }
         }
+        report_memory("last exit", memory_info());
+        // The tray trims its memory 2 s after the last window process exited.
         std::thread::sleep(Duration::from_secs(3));
         let end = memory_info();
         report_memory("+3 s idle", end);
+        report(&format!(
+            "cycle-test: tray handles {} at the start, {} at the end",
+            show(handles_start),
+            show(handle_count())
+        ));
         let l = test_log();
-        let leftover = l.started - l.exited;
+        let leftover = l.started.saturating_sub(l.exited);
         report(&format!(
             "cycle-test: {} window processes started, {reused} of {} re-shown in the same process, {leftover} left over",
             l.started,
@@ -751,6 +845,84 @@ fn start_cycle_test(n: u32) {
             test_end(1, "cycle-test: FAIL: the tray's PrivateUsage grew by more than 1 MB");
         }
         test_end(0, "cycle-test: PASS");
+    });
+}
+
+fn show(n: Option<u32>) -> String {
+    n.map_or("?".to_string(), |n| n.to_string())
+}
+
+/// A small random number generator for the stress test (xorshift).
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n.max(1)
+    }
+}
+
+fn sleep_ms(ms: u64) {
+    std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// `--stress-test N`: N times, click the tray icon (sometimes several times in a
+/// row), wait a random time (while the window process starts, paints, shows,
+/// hides or exits), sometimes hide it, then kill every window process. The
+/// tray must survive, have no window process left and not keep more handles.
+fn start_stress_test(n: u32) {
+    std::thread::spawn(move || {
+        sleep_ms(3000);
+        let seed =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        let mut rng = Rng(seed | 1);
+        report(&format!("stress-test: {n} rounds of click, random wait, kill (seed {seed})"));
+        report_memory("tray idle", memory_info());
+        let mut base = None;
+        let mut shown = 0;
+        for c in 1..=n {
+            let before = test_log();
+            for _ in 0..1 + rng.below(3) {
+                test_step(proto::TEST_TOGGLE);
+                sleep_ms(rng.below(40));
+            }
+            sleep_ms(rng.below(2500));
+            if rng.below(3) == 0 {
+                test_step(proto::TEST_HIDE);
+                sleep_ms(rng.below(1500));
+            }
+            test_step(proto::TEST_KILL);
+            if test_wait(Duration::from_secs(20), |l| l.exited == l.started).is_none() {
+                test_end(1, &format!("stress-test: FAIL: a window process did not end in round {c}"));
+            }
+            if test_log().shown > before.shown {
+                shown += 1;
+            }
+            // Handles opened once (the first start of a process) are not a leak.
+            if c == 5.min(n) {
+                base = handle_count();
+            }
+        }
+        sleep_ms(3000);
+        let end = handle_count();
+        report_memory("+3 s idle", memory_info());
+        let l = test_log();
+        let leftover = l.started.saturating_sub(l.exited);
+        report(&format!(
+            "stress-test: {} window processes started, {shown} rounds showed the window, {leftover} left over",
+            l.started
+        ));
+        report(&format!("stress-test: tray handles {} after round 5, {} at the end", show(base), show(end)));
+        if leftover > 0 {
+            test_end(1, "stress-test: FAIL: window processes left over");
+        }
+        match (base, end) {
+            (Some(a), Some(b)) if b <= a + 10 => {}
+            _ => test_end(1, "stress-test: FAIL: the tray keeps more handles than before"),
+        }
+        test_end(0, "stress-test: PASS");
     });
 }
 

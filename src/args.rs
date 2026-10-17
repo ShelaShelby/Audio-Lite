@@ -14,10 +14,15 @@ pub struct WindowArgs {
     pub no_tray: bool,
 }
 
+/// The longest `--linger-ms` taken (a day); more would overflow the exit time.
+pub const MAX_LINGER_MS: u64 = 24 * 60 * 60 * 1000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     Tray {
         cycle_test: Option<u32>,
+        /// CI only: start the window process and kill it at random times, N times.
+        stress_test: Option<u32>,
     },
     Window(WindowArgs),
     /// `--window` without a usable parent: nothing to do.
@@ -34,6 +39,7 @@ pub fn parse(args: &[String]) -> Mode {
     let mut window = false;
     let mut w = WindowArgs::default();
     let mut cycle_test = None;
+    let mut stress_test = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -41,13 +47,14 @@ pub fn parse(args: &[String]) -> Mode {
             "--no-tray" => w.no_tray = true,
             "--parent" => w.parent = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--at" => w.at = it.next().and_then(|v| point(v)),
-            "--linger-ms" => w.linger_ms = it.next().and_then(|v| v.parse().ok()),
+            "--linger-ms" => w.linger_ms = it.next().and_then(|v| v.parse().ok()).map(|ms: u64| ms.min(MAX_LINGER_MS)),
             "--cycle-test" => cycle_test = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0),
+            "--stress-test" => stress_test = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0),
             _ => {}
         }
     }
     match (window, w.parent) {
-        (false, _) => Mode::Tray { cycle_test },
+        (false, _) => Mode::Tray { cycle_test, stress_test },
         (true, 0) => Mode::Invalid,
         (true, _) => Mode::Window(w),
     }
@@ -89,16 +96,16 @@ mod tests {
 
     #[test]
     fn no_arguments_is_the_tray() {
-        assert_eq!(parse(&[]), Mode::Tray { cycle_test: None });
-        assert_eq!(parse(&v("--something else")), Mode::Tray { cycle_test: None });
+        assert_eq!(parse(&[]), Mode::Tray { cycle_test: None, stress_test: None });
+        assert_eq!(parse(&v("--something else")), Mode::Tray { cycle_test: None, stress_test: None });
     }
 
     #[test]
     fn cycle_test_count() {
-        assert_eq!(parse(&v("--cycle-test 100")), Mode::Tray { cycle_test: Some(100) });
-        assert_eq!(parse(&v("--cycle-test 0")), Mode::Tray { cycle_test: None });
-        assert_eq!(parse(&v("--cycle-test x")), Mode::Tray { cycle_test: None });
-        assert_eq!(parse(&v("--cycle-test")), Mode::Tray { cycle_test: None });
+        assert_eq!(parse(&v("--cycle-test 100")), Mode::Tray { cycle_test: Some(100), stress_test: None });
+        assert_eq!(parse(&v("--cycle-test 0")), Mode::Tray { cycle_test: None, stress_test: None });
+        assert_eq!(parse(&v("--cycle-test x")), Mode::Tray { cycle_test: None, stress_test: None });
+        assert_eq!(parse(&v("--cycle-test")), Mode::Tray { cycle_test: None, stress_test: None });
     }
 
     #[test]
@@ -130,6 +137,68 @@ mod tests {
             assert!(line.starts_with("\"C:\\My Tools\\audio-lite.exe\" --window"));
             let rest: Vec<String> = line.rsplit('"').next().unwrap().split_whitespace().map(str::to_string).collect();
             assert_eq!(parse(&rest), Mode::Window(w));
+        }
+    }
+
+    #[test]
+    fn stress_test_count() {
+        assert_eq!(parse(&v("--stress-test 200")), Mode::Tray { cycle_test: None, stress_test: Some(200) });
+        assert_eq!(parse(&v("--stress-test -1")), Mode::Tray { cycle_test: None, stress_test: None });
+    }
+
+    #[test]
+    fn huge_linger_is_capped() {
+        let m = parse(&v("--window --parent 5 --linger-ms 18446744073709551615"));
+        assert_eq!(m, Mode::Window(WindowArgs { parent: 5, linger_ms: Some(MAX_LINGER_MS), ..Default::default() }));
+        let m = parse(&v("--window --parent 5 --linger-ms 18446744073709551616"));
+        assert_eq!(m, Mode::Window(WindowArgs { parent: 5, ..Default::default() }));
+    }
+
+    /// Garbage never panics, and whatever comes out writes back to the same thing.
+    #[test]
+    fn garbage_arguments() {
+        let words = [
+            "--window",
+            "--parent",
+            "--at",
+            "--linger-ms",
+            "--no-tray",
+            "--cycle-test",
+            "--stress-test",
+            "",
+            "0",
+            "-1",
+            "1,2",
+            ",",
+            "1,",
+            ",2",
+            "99999999999",
+            "4294967295",
+            "4294967296",
+            "x",
+            "\u{0}",
+            "\"",
+            "--at=1,2",
+            "2147483647,-2147483648",
+            "2147483648,0",
+            " 3 , 4 ",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            let n = (seed % 7) as usize;
+            let mut a = Vec::new();
+            for _ in 0..n {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                a.push(words[(seed % words.len() as u64) as usize].to_string());
+            }
+            if let Mode::Window(w) = parse(&a) {
+                assert_ne!(w.parent, 0);
+                assert!(w.linger_ms.is_none_or(|ms| ms <= MAX_LINGER_MS));
+                assert_eq!(parse(&window_args(&w)), Mode::Window(w));
+            }
+            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
         }
     }
 }

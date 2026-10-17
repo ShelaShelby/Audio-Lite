@@ -319,25 +319,45 @@ fn volume_card(ui: &mut egui::Ui, st: &mut UiState, model: &Model, out: &mut Vec
     });
 }
 
+/// A key press while recording: the key as the layout names it, and the key at
+/// that place on the keyboard (they differ for Shift + digit, "!", or for
+/// Ctrl + Alt, which is AltGr on many layouts: Ctrl+Alt+E gives "€").
+enum Press {
+    Key(egui::Key, Option<egui::Key>, egui::Modifiers),
+    /// Ctrl+C, Ctrl+X or Ctrl+V: egui turns them into copy, cut and paste.
+    Clipboard,
+}
+
 /// While recording: the first key pressed with a modifier. Esc cancels.
 fn record(ui: &mut egui::Ui, st: &mut UiState, out: &mut Vec<Action>) {
-    let pressed: Vec<(egui::Key, egui::Modifiers)> = ui.input(|i| {
+    let pressed: Vec<Press> = ui.input(|i| {
         i.events
             .iter()
             .filter_map(|e| match e {
-                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some((*key, *modifiers)),
+                egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers } => {
+                    Some(Press::Key(*key, *physical_key, *modifiers))
+                }
+                egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_) => Some(Press::Clipboard),
                 _ => None,
             })
             .collect()
     });
-    for (key, m) in pressed {
+    for p in pressed {
+        let (key, physical, m) = match p {
+            Press::Key(key, physical, m) => (key, physical, m),
+            Press::Clipboard => {
+                st.record_error = Some(hotkey::CLIPBOARD);
+                continue;
+            }
+        };
         if key == egui::Key::Escape {
             st.recording = false;
             st.record_error = None;
             out.push(Action::CancelHotkey);
             return;
         }
-        match hotkey::combo(hotkey::Mods { ctrl: m.ctrl, alt: m.alt, shift: m.shift }, key.name()) {
+        let mods = hotkey::Mods { ctrl: m.ctrl, alt: m.alt, shift: m.shift };
+        match hotkey::combo_of(mods, key.name(), physical.map(|k| k.name())) {
             Ok(text) => {
                 st.recording = false;
                 st.record_error = None;

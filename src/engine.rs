@@ -12,10 +12,12 @@ use crate::audio::{self, Handle};
 use crate::coalesce::{self, Coalescer};
 use crate::cycle::Device;
 use crate::mixer::{self, Row};
+use crate::volume;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 use windows::core::{implement, Result as WinResult, GUID, PCWSTR};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::Media::Audio::Endpoints::{
     IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
@@ -186,7 +188,9 @@ impl Engine {
             live: AtomicBool::new(false),
         });
         let e = engine.clone();
-        std::thread::spawn(move || run(e));
+        // Builder, not thread::spawn: that one panics (aborts) if Windows refuses a
+        // thread. Without the thread the window shows no devices but still works.
+        let _ = std::thread::Builder::new().spawn(move || run(e));
         engine
     }
 
@@ -246,7 +250,8 @@ impl Engine {
     /// `last` (slider let go, click on the track, arrow key) writes it without
     /// waiting and ends the drag; otherwise the slider is being dragged.
     pub fn set_volume(&self, t: Target, v: f32, last: bool) {
-        let v = v.clamp(0.0, 1.0);
+        // NaN would be refused by Windows and shown as 0.
+        let Some(v) = volume::to_scalar(v) else { return };
         // Model and inbox change together, so a read of the values never sees one without the other.
         let mut inbox = lock(&self.inbox);
         lock(&self.model).set_level(&t, v);
@@ -299,7 +304,11 @@ impl IMMNotificationClient_Impl for Notifier_Impl {
         }
         Ok(())
     }
-    fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> WinResult<()> {
+    fn OnPropertyValueChanged(&self, _: &PCWSTR, key: &PROPERTYKEY) -> WinResult<()> {
+        // A device was renamed in Windows' sound settings.
+        if *key == PKEY_Device_FriendlyName {
+            self.engine.event(|| Cmd::Refresh);
+        }
         Ok(())
     }
 }
@@ -436,6 +445,11 @@ impl Audio {
     }
 
     fn watch_apps(&mut self) {
+        // A change event that came in just before the window was hidden must not
+        // register callbacks again while it is hidden.
+        if !self.engine.live.load(Ordering::Relaxed) {
+            return;
+        }
         for h in self.rows.iter().flat_map(|r| &r.handles) {
             if unsafe { h.control.RegisterAudioSessionNotification(&self.callbacks.app) }.is_ok() {
                 self.apps_watched.push(h.control.clone());
@@ -453,6 +467,9 @@ impl Audio {
 
     /// Register the change events on the current device, its master volume and its apps.
     fn watch(&mut self) {
+        if !self.engine.live.load(Ordering::Relaxed) {
+            return;
+        }
         unsafe {
             if let Some(m) = &self.master {
                 self.master_watched = m.RegisterControlChangeNotify(&self.callbacks.master).is_ok();

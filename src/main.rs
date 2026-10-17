@@ -18,6 +18,7 @@ mod mixer;
 mod place;
 mod proto;
 mod settings;
+mod tooltip;
 mod volume;
 
 #[cfg(windows)]
@@ -37,7 +38,7 @@ mod ui;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args::parse(&args) {
-        args::Mode::Tray { cycle_test } => tray::run(cycle_test),
+        args::Mode::Tray { cycle_test, stress_test } => tray::run(cycle_test, stress_test),
         args::Mode::Window(w) => app::run(w),
         args::Mode::Invalid => {}
     }

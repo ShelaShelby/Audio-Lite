@@ -149,4 +149,69 @@ mod tests {
         assert!(is_excluded("Lautsprecher ÄB", &ex(&["lautsprecher äb"])));
         assert!(!is_excluded("Speakers", &ex(&["Speaker"])));
     }
+
+    /// Every combination of 0 to 4 devices, ticks and current device (also one
+    /// that is gone): the answer is ticked, never the current one, the next
+    /// one in order, and None only if there is nothing else to go to.
+    #[test]
+    fn every_combination_of_up_to_four_devices() {
+        let all = ["Speakers", "Headphones", "TV", "Monitor"];
+        for n in 0..=all.len() {
+            let d = devs(&all[..n]);
+            for ticks in 0..(1u32 << n) {
+                let e: Vec<String> = (0..n).filter(|i| ticks & (1 << i) == 0).map(|i| all[i].to_string()).collect();
+                let ticked = |i: usize| ticks & (1 << i) != 0;
+                let currents: Vec<Option<String>> = std::iter::once(None)
+                    .chain((0..n).map(|i| Some(format!("id-{}", all[i]))))
+                    .chain([Some("id-Gone".into())])
+                    .collect();
+                for cur in &currents {
+                    let got = next_index(&d, cur.as_deref(), &e);
+                    let cur_i = cur.as_deref().and_then(|c| d.iter().position(|x| x.id == c));
+                    let want = match cur_i {
+                        Some(c) => (1..n).map(|s| (c + s) % n).find(|&i| ticked(i)),
+                        None => (0..n).find(|&i| ticked(i)),
+                    };
+                    assert_eq!(got, want, "n={n} ticks={ticks:b} cur={cur:?}");
+                    if let Some(i) = got {
+                        assert!(ticked(i));
+                        assert_ne!(Some(i), cur_i);
+                    }
+                }
+                // Pressing the hotkey again and again visits every ticked device in order.
+                let count = (0..n).filter(|&i| ticked(i)).count();
+                if count >= 2 {
+                    let mut cur = next_index(&d, None, &e).unwrap();
+                    let mut seen = vec![cur];
+                    for _ in 1..count {
+                        cur = next_index(&d, Some(&d[cur].id), &e).unwrap();
+                        seen.push(cur);
+                    }
+                    let mut sorted = seen.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    assert_eq!(sorted.len(), count);
+                    assert_eq!(next_index(&d, Some(&d[cur].id), &e), Some(seen[0]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unusual_names() {
+        // Two devices with the same name: unticking one unticks both (names are
+        // what settings.json keeps), and the hotkey still never picks the current one.
+        let d = vec![
+            Device { id: "a".into(), name: "Speakers".into() },
+            Device { id: "b".into(), name: "Speakers".into() },
+            Device { id: "c".into(), name: "".into() },
+        ];
+        assert_eq!(next_index(&d, Some("a"), &[]), Some(1));
+        assert_eq!(next_index(&d, Some("c"), &ex(&["speakers"])), None);
+        let mut e = Vec::new();
+        assert!(set_in_cycle(&mut e, &"x".repeat(5000), false));
+        assert!(is_excluded(&"X".repeat(5000), &e));
+        // An empty name in the exclude list does not exclude everything.
+        assert!(!is_excluded("TV", &ex(&[""])));
+    }
 }

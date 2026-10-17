@@ -132,4 +132,59 @@ mod tests {
         c.set(1, 0.4);
         assert!(c.take(t0 + 2 * MS).is_empty());
     }
+
+    /// Random drags on three sliders: writes never come closer than the gap
+    /// unless a value is final, and the newest value of each slider is always
+    /// the last one written.
+    #[test]
+    fn random_drags_keep_the_pace_and_lose_nothing() {
+        let mut seed = 0xdead_beef_cafe_f00du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..200 {
+            let mut c = Coalescer::new(GAP);
+            let t0 = Instant::now();
+            let mut now = t0;
+            let mut want = [None::<f32>; 3];
+            let mut written = [None::<f32>; 3];
+            let mut last_take: Option<Instant> = None;
+            let mut urgent = false;
+            for _ in 0..500 {
+                now += Duration::from_micros(next(8000));
+                let k = next(3) as usize;
+                let v = next(1001) as f32 / 1000.0;
+                if next(10) == 0 {
+                    c.set_final(k, v);
+                    urgent = true;
+                } else {
+                    c.set(k, v);
+                }
+                want[k] = Some(v);
+                let due = c.due(now).unwrap();
+                assert!(due >= now);
+                let out = c.take(now);
+                if !out.is_empty() {
+                    if let (Some(t), false) = (last_take, urgent) {
+                        assert!(now - t >= GAP);
+                    }
+                    last_take = Some(now);
+                    urgent = false;
+                    for (k, v) in out {
+                        written[k] = Some(v);
+                    }
+                }
+            }
+            // After the gap everything that waits is written.
+            let out = c.take(now + GAP);
+            for (k, v) in out {
+                written[k] = Some(v);
+            }
+            assert_eq!(written, want);
+            assert_eq!(c.due(now + GAP), None);
+        }
+    }
 }
