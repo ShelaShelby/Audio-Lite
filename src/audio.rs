@@ -10,8 +10,9 @@ use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, S_OK};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
-    eCommunications, eConsole, eMultimedia, eRender, AudioSessionStateExpired, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eCommunications, eConsole, eMultimedia, eRender, AudioSessionStateExpired, IAudioSessionControl,
+    IAudioSessionControl2, IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
+    MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
@@ -55,6 +56,15 @@ use policy::IPolicyConfig;
 const CLSID_POLICY_CONFIG_VISTA: GUID = GUID::from_u128(0x294935ce_f637_4e7c_a41b_ab255460b862);
 /// CPolicyConfigClient, the class most tools use with IPolicyConfig. Fallback.
 const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+/// Passed as the event context of every volume and mute change the app makes,
+/// so the change events for them can be told apart from changes made elsewhere.
+pub const APP_CONTEXT: GUID = GUID::from_u128(0x5e1a_0a17_3c4b_4d2e_9f61_a0d1_e7c3_b2a5);
+
+/// True if an event comes from one of the app's own changes.
+pub fn is_own(context: *const GUID) -> bool {
+    !context.is_null() && unsafe { *context } == APP_CONTEXT
+}
 
 pub fn enumerator() -> windows::core::Result<IMMDeviceEnumerator> {
     unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
@@ -155,25 +165,25 @@ pub fn endpoint_state(v: &IAudioEndpointVolume) -> windows::core::Result<(f32, b
 
 pub fn set_endpoint_volume(v: &IAudioEndpointVolume, scalar: f32) {
     unsafe {
-        let _ = v.SetMasterVolumeLevelScalar(scalar, std::ptr::null());
+        let _ = v.SetMasterVolumeLevelScalar(scalar, &APP_CONTEXT);
     }
 }
 
 pub fn set_endpoint_mute(v: &IAudioEndpointVolume, mute: bool) {
     unsafe {
-        let _ = v.SetMute(mute, std::ptr::null());
+        let _ = v.SetMute(mute, &APP_CONTEXT);
     }
 }
 
 pub fn set_session_volume(v: &ISimpleAudioVolume, scalar: f32) {
     unsafe {
-        let _ = v.SetMasterVolume(scalar, std::ptr::null());
+        let _ = v.SetMasterVolume(scalar, &APP_CONTEXT);
     }
 }
 
 pub fn set_session_mute(v: &ISimpleAudioVolume, mute: bool) {
     unsafe {
-        let _ = v.SetMute(mute, std::ptr::null());
+        let _ = v.SetMute(mute, &APP_CONTEXT);
     }
 }
 
@@ -261,32 +271,50 @@ impl NameCache {
     }
 }
 
-/// All audio sessions on `device`, expired ones included (the merge drops them).
-pub fn sessions(device: &IMMDevice, names: &mut NameCache) -> windows::core::Result<Vec<Session<ISimpleAudioVolume>>> {
+/// One session's volume control, and the control its events are registered on.
+pub struct Handle {
+    pub volume: ISimpleAudioVolume,
+    pub control: IAudioSessionControl,
+}
+
+/// The session manager of `device`. Its session list must be read once
+/// (`sessions`) before it reports new sessions.
+pub fn session_manager(device: &IMMDevice) -> windows::core::Result<IAudioSessionManager2> {
+    unsafe { device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) }
+}
+
+/// One session, read on the audio thread. `i` names it if it has no id.
+pub fn session(control: &IAudioSessionControl, i: i32, names: &mut NameCache) -> Option<Session<Handle>> {
     unsafe {
-        let manager = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)?;
+        let c2 = control.cast::<IAudioSessionControl2>().ok()?;
+        let volume = control.cast::<ISimpleAudioVolume>().ok()?;
+        let pid = c2.GetProcessId().unwrap_or(0);
+        let system = c2.IsSystemSoundsSession() == S_OK;
+        let (exe, description) = if system { (None, None) } else { names.get(pid) };
+        let (level, muted) = session_state(&volume).unwrap_or((1.0, false));
+        Some(Session {
+            id: c2.GetSessionInstanceIdentifier().ok().and_then(take_pwstr).unwrap_or_else(|| format!("#{i}")),
+            pid,
+            exe,
+            description,
+            display_name: control.GetDisplayName().ok().and_then(take_pwstr),
+            system,
+            expired: control.GetState() == Ok(AudioSessionStateExpired),
+            volume: level,
+            muted,
+            handle: Handle { volume, control: control.clone() },
+        })
+    }
+}
+
+/// All audio sessions of `manager`, expired ones included (the merge drops them).
+pub fn sessions(manager: &IAudioSessionManager2, names: &mut NameCache) -> windows::core::Result<Vec<Session<Handle>>> {
+    unsafe {
         let list = manager.GetSessionEnumerator()?;
         let mut out = Vec::new();
         for i in 0..list.GetCount()? {
             let Ok(control) = list.GetSession(i) else { continue };
-            let Ok(c2) = control.cast::<IAudioSessionControl2>() else { continue };
-            let Ok(volume) = control.cast::<ISimpleAudioVolume>() else { continue };
-            let pid = c2.GetProcessId().unwrap_or(0);
-            let system = c2.IsSystemSoundsSession() == S_OK;
-            let (exe, description) = if system { (None, None) } else { names.get(pid) };
-            let (level, muted) = session_state(&volume).unwrap_or((1.0, false));
-            out.push(Session {
-                id: c2.GetSessionInstanceIdentifier().ok().and_then(take_pwstr).unwrap_or_else(|| format!("#{i}")),
-                pid,
-                exe,
-                description,
-                display_name: control.GetDisplayName().ok().and_then(take_pwstr),
-                system,
-                expired: control.GetState() == Ok(AudioSessionStateExpired),
-                volume: level,
-                muted,
-                handle: volume,
-            });
+            out.extend(session(&control, i, names));
         }
         Ok(out)
     }

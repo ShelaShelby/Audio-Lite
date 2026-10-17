@@ -2,6 +2,15 @@
 
 What changed in each version, newest first.
 
+## 0.3.1
+
+- The mouse wheel always scrolls the window, also over a slider or a mute
+  button; it no longer changes volumes.
+- Changes made elsewhere (media keys, a headset wheel, other apps, apps
+  starting or stopping sound) show at once while the window is open:
+  Windows events instead of reading everything twice a second, plus a
+  cheap volume check every 3 s. Never while a slider is dragged.
+
 ## 0.3.0
 
 One window with everything, and smooth sliders. The look and the window

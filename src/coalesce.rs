@@ -1,7 +1,7 @@
 //! Volume writes, latest wins. The window only stores the newest wanted value
 //! per slider; the audio thread takes them out at most once per `gap` (about 60
-//! times a second). A value marked final (the slider was let go, a click, the
-//! mouse wheel) is written at once. Pure, no Windows calls.
+//! times a second). A value marked final (the slider was let go, a click on the
+//! track, an arrow key) is written at once. Pure, no Windows calls.
 
 use std::time::{Duration, Instant};
 

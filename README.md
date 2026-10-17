@@ -57,8 +57,8 @@ From top to bottom:
   app that has sound open (for example your browser, a music player and
   "System sounds"). Apps that are open but silent right now are listed
   too. If no app has sound open, it says "No apps playing audio".
-  Drag a slider or turn the mouse wheel over it (2 per notch). The
-  speaker button mutes and unmutes; crossed out means muted.
+  Drag a slider, click on its track, or use the arrow keys. The speaker
+  button mutes and unmutes; crossed out means muted.
 - **Hotkey**: the hotkey and the devices it goes through. Click
   **Change**, then press the new combination, for example
   Ctrl + Shift + F9. It needs Ctrl, Alt or Shift together with a letter,
@@ -69,11 +69,16 @@ From top to bottom:
 - **Quit**: closes the app and removes the tray icon.
 
 The window grows with its content. With many apps it stops growing (at
-640 points, or less on a small screen) and scrolls.
+640 points, or less on a small screen) and scrolls. The mouse wheel always
+scrolls the window, also over a slider or a mute button; it never changes
+a volume.
 
-While the window is open it follows changes made elsewhere (for example in
-Windows' own volume mixer) twice a second. If you switch the device with
-the hotkey, it shows the new one.
+While the window is open it shows changes made elsewhere right away (media
+keys, the volume wheel of a headset, Windows' own volume mixer, other
+apps): Windows tells the app about them, so nothing is read again and
+again. As a safety net it reads the volumes once every 3 seconds. Apps
+that start or stop sound appear and disappear at once. If you switch the
+device with the hotkey, it shows the new one.
 
 Point at the tray icon: the tooltip shows the device that plays the sound
 now. If switching went wrong, the tooltip says so on a second line.
@@ -85,7 +90,9 @@ window never waits for Windows audio: it only notes the newest value, and
 a separate audio thread sets it at most about 60 times a second, plus once
 more when you let go.
 
-When the window is closed nothing is drawn and no timer runs. 2 seconds
+When the window is closed nothing is drawn, no timer runs and volume
+changes made elsewhere are not followed (the window reads everything again
+when it opens). 2 seconds
 after it closes, its memory is given back to Windows, so Task Manager
 shows next to no RAM for it. The app then sleeps until you press the
 hotkey or click the tray icon.
@@ -140,7 +147,13 @@ Real sound and the look have to be tried on a real PC:
 - [ ] The sliders feel smooth when dragged (no jumps or lag).
 - [ ] With a video playing: the master slider and the browser's own slider
       change the volume while you drag.
-- [ ] The mouse wheel over a slider changes the volume by 2 per notch.
+- [ ] With many apps (the window scrolls): the mouse wheel scrolls the
+      window, also over a slider or a mute button, and never changes a
+      volume.
+- [ ] With the window open, change the volume with the media keys or the
+      headset wheel, and an app's volume in Windows' volume mixer: the
+      sliders follow at once. Start and stop a video: its row appears and
+      goes away.
 - [ ] The mute buttons mute and unmute (master and per app).
 - [ ] "Change" in the Hotkey card: a new combination works right away and
       is still there after a restart; a combination without Ctrl, Alt or
