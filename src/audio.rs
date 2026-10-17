@@ -2,14 +2,22 @@
 //! a new default with the undocumented IPolicyConfig interface.
 
 use crate::cycle::Device;
+use crate::mixer::Session;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use windows::core::{IUnknown, Interface, BSTR, GUID, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{CloseHandle, S_OK};
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
-    eCommunications, eConsole, eMultimedia, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-    DEVICE_STATE_ACTIVE,
+    eCommunications, eConsole, eMultimedia, eRender, AudioSessionStateExpired, IAudioSessionControl2,
+    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
+use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 #[allow(non_snake_case)]
 mod policy {
@@ -113,6 +121,169 @@ pub fn set_default(id: &str) -> Result<(), String> {
             .map_err(|e| format!("could not set default: {}", e.message()))?;
     }
     Ok(())
+}
+
+/// A string Windows allocated for us, copied and freed.
+fn take_pwstr(p: PWSTR) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    unsafe {
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        s
+    }
+}
+
+/// The default playback device and its master volume control.
+pub fn default_endpoint(e: &IMMDeviceEnumerator) -> windows::core::Result<(IMMDevice, IAudioEndpointVolume)> {
+    unsafe {
+        let d = e.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        let v = d.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)?;
+        Ok((d, v))
+    }
+}
+
+pub fn device_display_name(d: &IMMDevice) -> String {
+    device_name(d)
+}
+
+/// Master volume (0.0-1.0) and mute.
+pub fn endpoint_state(v: &IAudioEndpointVolume) -> windows::core::Result<(f32, bool)> {
+    unsafe { Ok((v.GetMasterVolumeLevelScalar()?, v.GetMute()?.as_bool())) }
+}
+
+pub fn set_endpoint_volume(v: &IAudioEndpointVolume, scalar: f32) {
+    unsafe {
+        let _ = v.SetMasterVolumeLevelScalar(scalar, std::ptr::null());
+    }
+}
+
+pub fn set_endpoint_mute(v: &IAudioEndpointVolume, mute: bool) {
+    unsafe {
+        let _ = v.SetMute(mute, std::ptr::null());
+    }
+}
+
+pub fn set_session_volume(v: &ISimpleAudioVolume, scalar: f32) {
+    unsafe {
+        let _ = v.SetMasterVolume(scalar, std::ptr::null());
+    }
+}
+
+pub fn set_session_mute(v: &ISimpleAudioVolume, mute: bool) {
+    unsafe {
+        let _ = v.SetMute(mute, std::ptr::null());
+    }
+}
+
+/// Current volume and mute of one session.
+pub fn session_state(v: &ISimpleAudioVolume) -> Option<(f32, bool)> {
+    unsafe { Some((v.GetMasterVolume().ok()?, v.GetMute().ok()?.as_bool())) }
+}
+
+/// Full exe path of a process, if Windows lets us read it.
+fn exe_path(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+/// The "File description" from an exe's version info ("Google Chrome").
+fn file_description(path: &str) -> Option<String> {
+    let wpath: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let size = GetFileVersionInfoSizeW(PCWSTR(wpath.as_ptr()), None);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        GetFileVersionInfoW(PCWSTR(wpath.as_ptr()), 0, size, data.as_mut_ptr() as *mut c_void).ok()?;
+        // The first language/code page pair, then the usual US English fallbacks.
+        let mut langs = Vec::new();
+        let mut ptr = std::ptr::null_mut();
+        let mut len = 0u32;
+        let q: Vec<u16> = "\\VarFileInfo\\Translation\0".encode_utf16().collect();
+        if VerQueryValueW(data.as_ptr() as *const c_void, PCWSTR(q.as_ptr()), &mut ptr, &mut len).as_bool() && len >= 4
+        {
+            let pair = std::slice::from_raw_parts(ptr as *const u16, 2);
+            langs.push(format!("{:04x}{:04x}", pair[0], pair[1]));
+        }
+        langs.extend(["040904b0".to_string(), "040904e4".to_string()]);
+        for lang in langs {
+            let q: Vec<u16> = format!("\\StringFileInfo\\{lang}\\FileDescription\0").encode_utf16().collect();
+            let mut ptr = std::ptr::null_mut();
+            let mut len = 0u32;
+            if VerQueryValueW(data.as_ptr() as *const c_void, PCWSTR(q.as_ptr()), &mut ptr, &mut len).as_bool()
+                && len > 0
+            {
+                let chars = std::slice::from_raw_parts(ptr as *const u16, len as usize);
+                let text = String::from_utf16_lossy(chars).trim_end_matches('\0').trim().to_string();
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Exe path and description per process id. Kept while the mixer is open so
+/// the version info is not read again every refresh.
+#[derive(Default)]
+pub struct NameCache(HashMap<u32, (Option<String>, Option<String>)>);
+
+impl NameCache {
+    fn get(&mut self, pid: u32) -> (Option<String>, Option<String>) {
+        self.0
+            .entry(pid)
+            .or_insert_with(|| {
+                let exe = exe_path(pid);
+                let description = exe.as_deref().and_then(file_description);
+                (exe, description)
+            })
+            .clone()
+    }
+}
+
+/// All audio sessions on `device`, expired ones included (the merge drops them).
+pub fn sessions(device: &IMMDevice, names: &mut NameCache) -> windows::core::Result<Vec<Session<ISimpleAudioVolume>>> {
+    unsafe {
+        let manager = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)?;
+        let list = manager.GetSessionEnumerator()?;
+        let mut out = Vec::new();
+        for i in 0..list.GetCount()? {
+            let Ok(control) = list.GetSession(i) else { continue };
+            let Ok(c2) = control.cast::<IAudioSessionControl2>() else { continue };
+            let Ok(volume) = control.cast::<ISimpleAudioVolume>() else { continue };
+            let pid = c2.GetProcessId().unwrap_or(0);
+            let system = c2.IsSystemSoundsSession() == S_OK;
+            let (exe, description) = if system { (None, None) } else { names.get(pid) };
+            let (level, muted) = session_state(&volume).unwrap_or((1.0, false));
+            out.push(Session {
+                id: c2.GetSessionInstanceIdentifier().ok().and_then(take_pwstr).unwrap_or_else(|| format!("#{i}")),
+                pid,
+                exe,
+                description,
+                display_name: control.GetDisplayName().ok().and_then(take_pwstr),
+                system,
+                expired: control.GetState() == Ok(AudioSessionStateExpired),
+                volume: level,
+                muted,
+                handle: volume,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

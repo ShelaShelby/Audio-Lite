@@ -8,8 +8,12 @@ your speakers to your headphones, to your TV, and back to the speakers.
 A short Windows "ding" plays on the new device, so you hear where the
 sound went.
 
-The app has no window. It sleeps until you press the hotkey or click the
-tray icon, so it uses next to no CPU or memory.
+Left click the tray icon for a small volume mixer: the master volume and
+one slider per app that plays sound.
+
+The app sleeps until you press the hotkey or click the tray icon, so it
+uses next to no CPU or memory. The mixer window only exists while it is
+open.
 
 ## What you need
 
@@ -39,7 +43,8 @@ Only one copy runs at a time. Starting it again does nothing.
 - Point at the tray icon: the tooltip shows the device that plays the
   sound now. If something went wrong (for example the hotkey is taken by
   another app), the tooltip says so on a second line.
-- Click the tray icon (left or right) for the menu:
+- Left click the tray icon: the volume mixer opens (see below).
+- Right click the tray icon for the menu:
   - your playback devices, with a check mark on the current one. Click
     one to switch to it.
   - "Start with Windows": on or off. Off at first.
@@ -53,6 +58,34 @@ multimedia and communications roles).
 Only devices that are plugged in and turned on are listed. The list is
 read again each time you press the hotkey or open the menu, so a
 Bluetooth headset that just connected shows up right away.
+
+## Volume mixer
+
+Left click the tray icon. A small window opens next to the tray:
+
+- At the top, the name of the device that plays the sound now.
+- **Master**: the volume of that device, 0 to 100, and a mute button
+  (the speaker icon; crossed out means muted).
+- Below a thin line, one row per app that has sound open, for example
+  your browser, a music player and "System sounds". Each row has its own
+  slider and mute button. Apps that are open but silent right now are
+  listed too. If no app has sound open, it says "No apps playing audio".
+
+How to use it:
+
+- Click or drag a slider. The volume changes right away.
+- Turn the mouse wheel over a row: the volume goes up or down by 2.
+- Click the speaker icon to mute or unmute.
+- Close it with Esc, a click anywhere outside it, or another click on the
+  tray icon.
+
+While it is open, it follows changes made elsewhere (for example in
+Windows' own volume mixer) twice a second. If you switch the device with
+the hotkey or the menu, it shows the new device. The colours follow the
+Windows light or dark mode setting (read each time it opens).
+
+The window shows at most 10 apps. If more apps have sound open, a last
+line says how many are not shown ("and 2 more"). There is no scrolling.
 
 ## Settings file
 
@@ -97,8 +130,9 @@ open an issue then.
 
 ## What to test on your PC
 
-The automatic tests run on a GitHub machine without a sound card, so they
-check the logic only. Real sound has to be tried on a real PC:
+The automatic tests run on a GitHub machine without a sound card or a
+screen, so they check the logic only. Real sound and the look of the mixer
+have to be tried on a real PC:
 
 - [ ] With two or more devices, Ctrl + Alt + A goes to the next one each
       time and wraps around to the first. The tooltip shows the new name.
@@ -115,6 +149,26 @@ check the logic only. Real sound has to be tried on a real PC:
       tooltip follows.
 - [ ] Start the app a second time: no second icon.
 - [ ] Task Manager: the app uses almost no CPU and little memory when idle.
+
+The volume mixer:
+
+- [ ] Left click the tray icon: the mixer opens next to the tray. It closes
+      with Esc, with a click outside it and with another click on the icon.
+      Right click still opens the menu.
+- [ ] The master slider changes the volume, the mute button mutes and
+      unmutes, and Windows' own volume shows the same.
+- [ ] Play a video in the browser: the browser has a row, and its slider and
+      mute button change only the browser's sound.
+- [ ] The mouse wheel over a row changes its volume in steps of 2.
+- [ ] With the mixer open, change a volume in Windows' own mixer or with the
+      keyboard volume keys: the mixer follows within a second. Dragging a
+      slider is never interrupted.
+- [ ] Windows dark mode and light mode: the mixer uses matching colours
+      (close and open it again after switching). Text is sharp on a
+      high-DPI screen.
+- [ ] Press Ctrl + Alt + A while the mixer is open: it shows the new device
+      and its apps.
+- [ ] With the mixer closed, Task Manager shows 0% CPU for Audio Lite.
 
 ## Build from source
 

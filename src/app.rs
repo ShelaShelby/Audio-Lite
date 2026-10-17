@@ -4,7 +4,7 @@
 
 use crate::cycle::{self, Device};
 use crate::settings::{self, Settings};
-use crate::{audio, autostart, icon};
+use crate::{audio, autostart, icon, popup};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -80,7 +80,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// Ask Windows to drop our pages from RAM; they come back on the next use.
-fn trim_memory() {
+pub fn trim_memory() {
     unsafe {
         let _ = EmptyWorkingSet(GetCurrentProcess());
     }
@@ -219,6 +219,8 @@ impl App {
                 unsafe {
                     let _ = MessageBeep(MB_OK);
                 }
+                // Usually the device notification does this too; this covers a missing one.
+                popup::reload();
             }
             Err(e) => self.note = Some(e),
         }
@@ -301,6 +303,7 @@ impl App {
             }
             CMD_SETTINGS => self.open_settings(),
             CMD_QUIT => unsafe {
+                popup::close();
                 let _ = Shell_NotifyIconW(NIM_DELETE, &self.icon_data());
                 if let (Some(e), Some(n)) = (&self.enumerator, &self.notifier) {
                     let _ = e.UnregisterEndpointNotificationCallback(n);
@@ -342,7 +345,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_TRAY => {
             let event = (lparam.0 & 0xFFFF) as u32;
-            if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
+            if event == WM_LBUTTONUP {
+                popup::toggle();
+            } else if event == WM_RBUTTONUP {
+                popup::close();
                 show_menu(hwnd);
             }
             LRESULT(0)
@@ -354,6 +360,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 a.update_tray();
             });
+            popup::reload();
             LRESULT(0)
         }
         // Explorer restarted: put the icon back.
