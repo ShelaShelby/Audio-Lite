@@ -56,7 +56,7 @@ pub fn pixels(size: usize) -> Vec<u8> {
 /// The same picture with the bytes in RGBA order (for the tray icon and the window).
 pub fn rgba(size: usize) -> Vec<u8> {
     let mut p = pixels(size);
-    for px in p.chunks_exact_mut(4) {
+    for px in p.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     p
@@ -81,7 +81,7 @@ mod tests {
     fn rgba_swaps_red_and_blue() {
         let (b, r) = (pixels(16), rgba(16));
         assert_eq!(b.len(), r.len());
-        for (x, y) in b.chunks_exact(4).zip(r.chunks_exact(4)) {
+        for (x, y) in b.as_chunks::<4>().0.iter().zip(r.as_chunks::<4>().0) {
             assert_eq!([x[2], x[1], x[0], x[3]], [y[0], y[1], y[2], y[3]]);
         }
     }
