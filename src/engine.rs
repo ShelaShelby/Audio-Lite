@@ -5,11 +5,12 @@
 //!
 //! Changes made elsewhere (media keys, a headset wheel, other apps) come as
 //! Windows events while the window is open. The callbacks only leave a request
-//! here; the audio thread reads the new values and asks for one redraw.
+//! here; the audio thread reads the new values and asks for one redraw. While
+//! the window is hidden no callback is registered at all.
 
 use crate::audio::{self, Handle};
 use crate::coalesce::{self, Coalescer};
-use crate::cycle::{self, Device};
+use crate::cycle::Device;
 use crate::mixer::{self, Row};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -26,9 +27,7 @@ use windows::Win32::Media::Audio::{
     IMMNotificationClient_Impl, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
-use windows::Win32::UI::WindowsAndMessaging::MB_OK;
 
 /// What a slider controls.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -119,8 +118,8 @@ enum Cmd {
     Sessions(Option<NewSession>),
     SetDefault(String),
     Mute(Target, bool),
-    /// The hotkey: go to the next device not in this exclude list, and beep.
-    Cycle(Vec<String>),
+    /// The window was hidden: let go of the change events.
+    Unwatch,
     Quit(std::sync::mpsc::Sender<()>),
 }
 
@@ -166,8 +165,8 @@ pub struct Engine {
     changed: fn(),
     /// Called on the audio thread after only volumes or mutes changed.
     redraw: fn(),
-    /// The window is open: follow change events. While it is closed they are
-    /// ignored (opening it reads everything again).
+    /// The window is open: follow change events. While it is closed none are
+    /// registered (opening it reads everything again).
     live: AtomicBool,
 }
 
@@ -227,22 +226,20 @@ impl Engine {
         self.send(Cmd::Values);
     }
 
-    /// The window was opened (true) or closed (false). Closing also ends a drag.
+    /// The window was opened (true) or closed (false). Closing also ends a drag
+    /// and unregisters the change events; opening is followed by `refresh`,
+    /// which registers them again.
     pub fn set_live(&self, on: bool) {
         self.live.store(on, Ordering::Relaxed);
         if !on {
             lock(&self.inbox).held = None;
-            self.wake.notify_one();
+            self.send(Cmd::Unwatch);
         }
     }
 
     pub fn set_default(&self, id: String) {
         lock(&self.model).default_id = Some(id.clone());
         self.send(Cmd::SetDefault(id));
-    }
-
-    pub fn cycle(&self, excluded: Vec<String>) {
-        self.send(Cmd::Cycle(excluded));
     }
 
     /// Ask for a volume (0.0-1.0). Only the newest value per target is written.
@@ -278,7 +275,8 @@ impl Engine {
     }
 }
 
-/// Asks for a refresh when the default device changes or a device comes or goes.
+/// Asks for a refresh when the default device changes or a device comes or goes
+/// (only while the window is open).
 #[implement(IMMNotificationClient)]
 struct Notifier {
     engine: Arc<Engine>,
@@ -286,7 +284,7 @@ struct Notifier {
 
 impl IMMNotificationClient_Impl for Notifier_Impl {
     fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> WinResult<()> {
-        self.engine.refresh();
+        self.engine.event(|| Cmd::Refresh);
         Ok(())
     }
     fn OnDeviceAdded(&self, _: &PCWSTR) -> WinResult<()> {
@@ -297,7 +295,7 @@ impl IMMNotificationClient_Impl for Notifier_Impl {
     }
     fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, _: &PCWSTR) -> WinResult<()> {
         if flow == eRender && role == eConsole {
-            self.engine.refresh();
+            self.engine.event(|| Cmd::Refresh);
         }
         Ok(())
     }
@@ -539,7 +537,9 @@ impl Audio {
             self.names.retain_rows(&self.rows);
         }
         drop(old_rows);
-        self.watch();
+        if self.engine.live.load(Ordering::Relaxed) {
+            self.watch();
+        }
         m.apps = self.app_levels();
         let inbox = lock(&self.engine.inbox);
         let mut model = lock(&self.engine.model);
@@ -616,21 +616,6 @@ impl Audio {
     fn switch_to(&mut self, id: &str) -> Option<String> {
         audio::set_default(id).err()
     }
-
-    fn cycle(&mut self, excluded: &[String]) -> Option<Option<String>> {
-        let e = self.enumerator.as_ref()?;
-        let devices = audio::devices(e).ok()?;
-        let current = audio::default_device(e).map(|d| d.id);
-        let i = cycle::next_index(&devices, current.as_deref(), excluded)?;
-        let err = self.switch_to(&devices[i].id);
-        if err.is_none() {
-            // The default sound now plays on the new device.
-            unsafe {
-                let _ = MessageBeep(MB_OK);
-            }
-        }
-        Some(err)
-    }
 }
 
 fn run(engine: Arc<Engine>) {
@@ -701,15 +686,15 @@ fn run(engine: Arc<Engine>) {
                     apps = true;
                 }
                 Cmd::Mute(t, on) => a.write_mute(&t, on),
+                Cmd::Unwatch => {
+                    // Asked again since: the newest wish wins.
+                    if !engine.live.load(Ordering::Relaxed) {
+                        a.unwatch();
+                    }
+                }
                 Cmd::SetDefault(id) => {
                     note = Some(a.switch_to(&id));
                     refresh = true;
-                }
-                Cmd::Cycle(excluded) => {
-                    if let Some(err) = a.cycle(&excluded) {
-                        note = Some(err);
-                        refresh = true;
-                    }
                 }
                 Cmd::Quit(done) => {
                     a.unwatch();
