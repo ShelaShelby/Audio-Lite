@@ -28,6 +28,8 @@ pub struct Row<T> {
     pub name: String,
     /// Session ids, sorted. Part of the row's identity.
     pub ids: Vec<String>,
+    /// The processes of its sessions, sorted, each once.
+    pub pids: Vec<u32>,
     /// Volume of the first session (the slider moves all of them together).
     pub volume: f32,
     /// True only if every session is muted.
@@ -84,6 +86,7 @@ pub fn merge<T>(sessions: Vec<Session<T>>) -> Vec<Row<T>> {
         match rows.iter_mut().find(|r| r.key == key) {
             Some(r) => {
                 r.ids.push(s.id);
+                r.pids.push(s.pid);
                 r.muted &= s.muted;
                 r.handles.push(s.handle);
             }
@@ -91,6 +94,7 @@ pub fn merge<T>(sessions: Vec<Session<T>>) -> Vec<Row<T>> {
                 name: name_of(&s),
                 key,
                 ids: vec![s.id],
+                pids: vec![s.pid],
                 volume: s.volume,
                 muted: s.muted,
                 handles: vec![s.handle],
@@ -99,6 +103,8 @@ pub fn merge<T>(sessions: Vec<Session<T>>) -> Vec<Row<T>> {
     }
     for r in &mut rows {
         r.ids.sort();
+        r.pids.sort_unstable();
+        r.pids.dedup();
     }
     rows.sort_by(|a, b| {
         (a.key == "system", a.name.to_lowercase(), &a.key).cmp(&(b.key == "system", b.name.to_lowercase(), &b.key))
@@ -141,13 +147,15 @@ mod tests {
         assert_eq!(rows[0].name, "player");
         assert_eq!(rows[0].ids, vec!["a", "b"]);
         assert_eq!(rows[0].handles.len(), 2);
+        assert_eq!(rows[0].pids, vec![10]);
         assert_eq!(rows[0].volume, 0.3);
     }
 
     #[test]
     fn same_exe_in_two_processes_is_one_row() {
-        let rows = merge(vec![s("a", 10, Some("C:\\B\\chrome.exe")), s("b", 11, Some("c:\\b\\CHROME.EXE"))]);
+        let rows = merge(vec![s("a", 11, Some("C:\\B\\chrome.exe")), s("b", 10, Some("c:\\b\\CHROME.EXE"))]);
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pids, vec![10, 11]);
     }
 
     #[test]

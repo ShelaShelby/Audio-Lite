@@ -2,7 +2,7 @@
 //! a new default with the undocumented IPolicyConfig interface.
 
 use crate::cycle::Device;
-use crate::mixer::Session;
+use crate::mixer::{Row, Session};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use windows::core::{IUnknown, Interface, BSTR, GUID, PCWSTR, PWSTR};
@@ -237,12 +237,18 @@ fn file_description(path: &str) -> Option<String> {
     }
 }
 
-/// Exe path and description per process id. Kept while the mixer is open so
-/// the version info is not read again every refresh.
+/// Exe path and description per process id, so the version info is not read
+/// again every refresh.
 #[derive(Default)]
 pub struct NameCache(HashMap<u32, (Option<String>, Option<String>)>);
 
 impl NameCache {
+    /// Keep only the processes that still have a row.
+    pub fn retain_rows<T>(&mut self, rows: &[Row<T>]) {
+        let keep: Vec<u32> = rows.iter().flat_map(|r| r.pids.iter().copied()).collect();
+        self.0.retain(|pid, _| keep.contains(pid));
+    }
+
     fn get(&mut self, pid: u32) -> (Option<String>, Option<String>) {
         self.0
             .entry(pid)

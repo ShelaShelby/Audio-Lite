@@ -15,6 +15,23 @@ pub fn is_excluded(name: &str, excluded: &[String]) -> bool {
     excluded.iter().any(|e| e.trim().to_lowercase() == name)
 }
 
+/// Tick or untick "In hotkey cycle" for the device `name`. Unticked devices are
+/// kept as names in the exclude list of settings.json. Returns true if the list changed.
+pub fn set_in_cycle(excluded: &mut Vec<String>, name: &str, on: bool) -> bool {
+    let before = excluded.len();
+    if on {
+        excluded.retain(|e| !is_excluded(name, std::slice::from_ref(e)));
+    } else if !is_excluded(name, excluded) {
+        excluded.push(name.trim().to_string());
+    }
+    excluded.len() != before
+}
+
+/// The devices the hotkey goes through, in order (the ones ticked "In hotkey cycle").
+pub fn cycle_list<'a>(devices: &'a [Device], excluded: &[String]) -> Vec<&'a Device> {
+    devices.iter().filter(|d| !is_excluded(&d.name, excluded)).collect()
+}
+
 /// Index of the device to switch to, or `None` if there is nothing to switch to.
 ///
 /// - Starts after the current device and wraps around.
@@ -100,6 +117,31 @@ mod tests {
         assert_eq!(next_index(&d, Some("id-Gone"), &[]), Some(0));
         assert_eq!(next_index(&d, Some("id-Gone"), &ex(&["Speakers"])), Some(1));
         assert_eq!(next_index(&d, None, &[]), Some(0));
+    }
+
+    #[test]
+    fn cycle_list_follows_the_checkboxes() {
+        let d = devs(&["Speakers", "Headphones", "TV"]);
+        let mut e = Vec::new();
+        let names = |e: &[String]| cycle_list(&d, e).iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&e), vec!["Speakers", "Headphones", "TV"]);
+
+        assert!(set_in_cycle(&mut e, "TV", false));
+        assert!(!set_in_cycle(&mut e, "tv", false), "already out");
+        assert_eq!(e, vec!["TV"]);
+        assert_eq!(names(&e), vec!["Speakers", "Headphones"]);
+        assert_eq!(next_index(&d, Some("id-Headphones"), &e), Some(0));
+
+        assert!(set_in_cycle(&mut e, "Headphones", false));
+        assert_eq!(names(&e), vec!["Speakers"]);
+        assert_eq!(next_index(&d, Some("id-Speakers"), &e), None);
+
+        // Ticking again removes every spelling of the name.
+        e.push(" tv ".into());
+        assert!(set_in_cycle(&mut e, "TV", true));
+        assert_eq!(e, vec!["Headphones"]);
+        assert!(!set_in_cycle(&mut e, "TV", true));
+        assert_eq!(names(&e), vec!["Speakers", "TV"]);
     }
 
     #[test]

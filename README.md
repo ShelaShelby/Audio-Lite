@@ -1,6 +1,8 @@
 # Audio Lite
 
-A tiny Windows app that switches your sound output with one hotkey.
+A small Windows tray app for your sound output: one window to pick the
+playback device and set the volumes, and one hotkey that switches to the
+next device.
 
 It sits in the tray (the small icons next to the clock). Press
 **Ctrl + Alt + A** and the sound moves to the next playback device: from
@@ -8,12 +10,9 @@ your speakers to your headphones, to your TV, and back to the speakers.
 A short Windows "ding" plays on the new device, so you hear where the
 sound went.
 
-Left click the tray icon for a small volume mixer: the master volume and
-one slider per app that plays sound.
-
-The app sleeps until you press the hotkey or click the tray icon, so it
-uses next to no CPU or memory. The mixer window only exists while it is
-open.
+Left click the tray icon to open the window. It looks like its sibling
+app [Brightness Lite](https://github.com/ShelaShelby/brightness-lite):
+dark cards, blue sliders.
 
 ## What you need
 
@@ -24,6 +23,10 @@ open.
 Go to the [Releases page](https://github.com/ShelaShelby/Audio-Lite/releases/latest)
 and download `audio-lite.exe`. `SHA256SUMS` lets you check that the
 download is not damaged.
+
+The exe is about 4 MB. Up to version 0.2 it was about 300 KB; the window
+is now drawn with a UI toolkit (egui, the same as in Brightness Lite), and
+that is where the extra size comes from.
 
 ## Install
 
@@ -36,62 +39,62 @@ download is not damaged.
 
 Only one copy runs at a time. Starting it again does nothing.
 
-## How to use it
+## The window
 
-- **Ctrl + Alt + A**: switch to the next playback device. After the last
-  one it starts again at the first.
-- Point at the tray icon: the tooltip shows the device that plays the
-  sound now. If something went wrong (for example the hotkey is taken by
-  another app), the tooltip says so on a second line.
-- Left click the tray icon: the volume mixer opens (see below).
-- Right click the tray icon for the menu:
-  - your playback devices, with a check mark on the current one. Click
-    one to switch to it.
-  - "Start with Windows": on or off. Off at first.
-  - "Open settings file": opens `settings.json` in Notepad.
-  - "Quit".
+Left click the tray icon. The window opens next to the tray. Another left
+click, its X, Esc or a click anywhere outside it closes it. Right click on
+the tray icon does nothing (there is no menu).
 
-The new device becomes the default for everything: music and videos,
-games and system sounds, and calls (Windows calls these the console,
-multimedia and communications roles).
+From top to bottom:
 
-Only devices that are plugged in and turned on are listed. The list is
-read again each time you press the hotkey or open the menu, so a
-Bluetooth headset that just connected shows up right away.
+- **Output**: your playback devices. The current one is highlighted.
+  Click another one to make it the default. It becomes the default for
+  everything: music and videos, games and system sounds, and calls
+  (Windows calls these the console, multimedia and communications roles).
+  Each device has an **In hotkey cycle** checkbox: untick it and the
+  hotkey skips that device (you can still click it here).
+- **Volume**: the master volume of the current device, then one row per
+  app that has sound open (for example your browser, a music player and
+  "System sounds"). Apps that are open but silent right now are listed
+  too. If no app has sound open, it says "No apps playing audio".
+  Drag a slider or turn the mouse wheel over it (2 per notch). The
+  speaker button mutes and unmutes; crossed out means muted.
+- **Hotkey**: the hotkey and the devices it goes through. Click
+  **Change**, then press the new combination, for example
+  Ctrl + Shift + F9. It needs Ctrl, Alt or Shift together with a letter,
+  a digit or F1 to F24. If another program already uses that combination,
+  the window says so and the old hotkey stays. Esc or "Cancel" stops
+  without changing it.
+- **Start with Windows**: on or off. Off at first.
+- **Quit**: closes the app and removes the tray icon.
 
-## Volume mixer
+The window grows with its content. With many apps it stops growing (at
+640 points, or less on a small screen) and scrolls.
 
-Left click the tray icon. A small window opens next to the tray:
-
-- At the top, the name of the device that plays the sound now.
-- **Master**: the volume of that device, 0 to 100, and a mute button
-  (the speaker icon; crossed out means muted).
-- Below a thin line, one row per app that has sound open, for example
-  your browser, a music player and "System sounds". Each row has its own
-  slider and mute button. Apps that are open but silent right now are
-  listed too. If no app has sound open, it says "No apps playing audio".
-
-How to use it:
-
-- Click or drag a slider. The volume changes right away.
-- Turn the mouse wheel over a row: the volume goes up or down by 2.
-- Click the speaker icon to mute or unmute.
-- Close it with Esc, a click anywhere outside it, or another click on the
-  tray icon.
-
-While it is open, it follows changes made elsewhere (for example in
+While the window is open it follows changes made elsewhere (for example in
 Windows' own volume mixer) twice a second. If you switch the device with
-the hotkey or the menu, it shows the new device. The colours follow the
-Windows light or dark mode setting (read each time it opens).
+the hotkey, it shows the new one.
 
-The window shows at most 10 apps. If more apps have sound open, a last
-line says how many are not shown ("and 2 more"). There is no scrolling.
+Point at the tray icon: the tooltip shows the device that plays the sound
+now. If switching went wrong, the tooltip says so on a second line.
+
+## Smooth sliders, light on the PC
+
+The sliders move freely; the number next to them is a whole percent. The
+window never waits for Windows audio: it only notes the newest value, and
+a separate audio thread sets it at most about 60 times a second, plus once
+more when you let go.
+
+When the window is closed nothing is drawn and no timer runs. 2 seconds
+after it closes, its memory is given back to Windows, so Task Manager
+shows next to no RAM for it. The app then sleeps until you press the
+hotkey or click the tray icon.
 
 ## Settings file
 
-You do not need it. Without it the app uses the defaults. If you want to
-change the hotkey or skip some devices, click "Open settings file" in the
-tray menu. It looks like this:
+You do not need to touch it. The window writes it when you change the
+hotkey or an "In hotkey cycle" checkbox, and only then. It looks like
+this:
 
 ```json
 {
@@ -100,14 +103,8 @@ tray menu. It looks like this:
 }
 ```
 
-- `hotkey`: one or more of `Ctrl`, `Alt`, `Shift`, `Win`, then one key:
-  `A` to `Z`, `0` to `9` or `F1` to `F24`. For example `Ctrl+Shift+F9`.
-- `exclude`: device names the hotkey skips, written as in the tray menu
-  (upper or lower case does not matter). They stay in the tray menu, so
-  you can still pick them by hand.
-
-Save the file. The app reads it again the next time you press the hotkey
-or open the menu.
+- `hotkey`: the hotkey.
+- `exclude`: the devices with "In hotkey cycle" unticked.
 
 Where the file is:
 
@@ -115,9 +112,8 @@ Where the file is:
   (handy on a USB stick).
 - Otherwise `%APPDATA%\Audio Lite\settings.json`.
 
-The app only writes this file when you click "Open settings file" and it
-does not exist yet. If the file is broken or deleted, the app uses the
-defaults.
+If the file is missing or broken, the app uses the defaults
+(Ctrl + Alt + A, every device in the cycle).
 
 ## Good to know
 
@@ -125,65 +121,35 @@ Windows has no official way for apps to change the default sound device.
 Audio Lite uses the same undocumented Windows interface (`IPolicyConfig`)
 that other sound switchers use. It has worked the same way since
 Windows 7, but a Windows update could change it. If switching stops
-working, the tooltip shows the error and the app keeps running. Please
-open an issue then.
+working, the window and the tooltip show the error and the app keeps
+running. Please open an issue then.
 
 ## What to test on your PC
 
-The automatic tests run on a GitHub machine without a sound card or a
-screen, so they check the logic only. Real sound and the look of the mixer
-have to be tried on a real PC:
+The automatic tests run on a GitHub machine without a sound card, so they
+check the logic only (and that the window opens and hides 300 times).
+Real sound and the look have to be tried on a real PC:
 
-- [ ] With two or more devices, Ctrl + Alt + A goes to the next one each
-      time and wraps around to the first. The tooltip shows the new name.
-- [ ] The "ding" plays on the new device, not the old one.
-- [ ] The tray menu lists the devices, the check mark is on the right one,
-      and clicking another one switches to it.
-- [ ] A device in `exclude` is skipped by the hotkey but still works from
-      the menu.
+- [ ] Left click on the tray icon opens the window; it closes with its X,
+      with Esc, with a click outside it and with another tray click.
+- [ ] Right click on the tray icon does nothing.
+- [ ] Clicking a device in "Output" makes it the default (check in
+      Windows' sound settings); the highlight moves to it.
+- [ ] Untick "In hotkey cycle" for a device: Ctrl + Alt + A skips it. Tick
+      it again: the hotkey uses it again. The ding plays on the new device.
+- [ ] The sliders feel smooth when dragged (no jumps or lag).
+- [ ] With a video playing: the master slider and the browser's own slider
+      change the volume while you drag.
+- [ ] The mouse wheel over a slider changes the volume by 2 per notch.
+- [ ] The mute buttons mute and unmute (master and per app).
+- [ ] "Change" in the Hotkey card: a new combination works right away and
+      is still there after a restart; a combination without Ctrl, Alt or
+      Shift is refused; one taken by another program shows an error.
 - [ ] "Start with Windows": turn it on, sign out and in again, the icon is
       back. Turn it off, sign out and in, it is gone.
-- [ ] Bluetooth: connect a headset, press the hotkey or open the menu, it
-      is in the list. Turn it off, it is gone and the hotkey skips it.
-- [ ] Change the default device in Windows' own sound settings: the
-      tooltip follows.
+- [ ] "Quit" closes the app and the tray icon goes away.
+- [ ] RAM near zero when closed: open and close the window, wait a few
+      seconds, Task Manager's "Memory" column for Audio Lite is very small.
+- [ ] The dark theme matches Brightness Lite (cards, blue sliders, round
+      corners, font).
 - [ ] Start the app a second time: no second icon.
-- [ ] Task Manager: the app uses almost no CPU and little memory when idle.
-
-The volume mixer:
-
-- [ ] Left click the tray icon: the mixer opens next to the tray. It closes
-      with Esc, with a click outside it and with another click on the icon.
-      Right click still opens the menu.
-- [ ] The master slider changes the volume, the mute button mutes and
-      unmutes, and Windows' own volume shows the same.
-- [ ] Play a video in the browser: the browser has a row, and its slider and
-      mute button change only the browser's sound.
-- [ ] The mouse wheel over a row changes its volume in steps of 2.
-- [ ] With the mixer open, change a volume in Windows' own mixer or with the
-      keyboard volume keys: the mixer follows within a second. Dragging a
-      slider is never interrupted.
-- [ ] Windows dark mode and light mode: the mixer uses matching colours
-      (close and open it again after switching). Text is sharp on a
-      high-DPI screen.
-- [ ] Press Ctrl + Alt + A while the mixer is open: it shows the new device
-      and its apps.
-- [ ] With the mixer closed, Task Manager shows 0% CPU for Audio Lite.
-
-## Build from source
-
-You need [Rust](https://rustup.rs). Then:
-
-    git clone https://github.com/ShelaShelby/Audio-Lite
-    cd Audio-Lite
-    cargo build --release
-
-The app is then in `target\release\audio-lite.exe`. Run the tests with
-`cargo test`.
-
-A new release is made by GitHub on its own when the version number in
-`Cargo.toml` changes on the main branch.
-
-## License
-
-MIT. See the [LICENSE](LICENSE) file.

@@ -53,6 +53,15 @@ pub fn pixels(size: usize) -> Vec<u8> {
     out
 }
 
+/// The same picture with the bytes in RGBA order (for the tray icon and the window).
+pub fn rgba(size: usize) -> Vec<u8> {
+    let mut p = pixels(size);
+    for px in p.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +74,15 @@ mod tests {
             assert_eq!(p[3], 0, "top-left corner is transparent");
             let mid = (size / 2 * size + size / 2) * 4;
             assert_eq!(p[mid + 3], 255, "middle is opaque");
+        }
+    }
+
+    #[test]
+    fn rgba_swaps_red_and_blue() {
+        let (b, r) = (pixels(16), rgba(16));
+        assert_eq!(b.len(), r.len());
+        for (x, y) in b.chunks_exact(4).zip(r.chunks_exact(4)) {
+            assert_eq!([x[2], x[1], x[0], x[3]], [y[0], y[1], y[2], y[3]]);
         }
     }
 }
