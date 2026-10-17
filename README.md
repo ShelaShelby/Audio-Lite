@@ -90,12 +90,13 @@ window never waits for Windows audio: it only notes the newest value, and
 a separate audio thread sets it at most about 60 times a second, plus once
 more when you let go.
 
-When the window is closed nothing is drawn, no timer runs and volume
-changes made elsewhere are not followed (the window reads everything again
-when it opens). 2 seconds
-after it closes, its memory is given back to Windows, so Task Manager
-shows next to no RAM for it. The app then sleeps until you press the
-hotkey or click the tray icon.
+## Two processes
+
+Task Manager shows two `audio-lite.exe` while the window is open. The tray part
+(icon, hotkey, device switching) is small and never draws a window. A tray
+click starts the window part; after the window is closed it waits 30 s for
+the next click, doing nothing, then exits and gives all its memory back to
+Windows (graphics driver memory too), so nothing can pile up over time.
 
 ## Settings file
 
@@ -134,7 +135,8 @@ running. Please open an issue then.
 ## What to test on your PC
 
 The automatic tests run on a GitHub machine without a sound card, so they
-check the logic only (and that the window opens and hides 300 times).
+check the logic only (and that the window process starts, shows, hides
+and exits 100 times without the tray process growing).
 Real sound and the look have to be tried on a real PC:
 
 - [ ] Left click on the tray icon opens the window; it closes with its X,
@@ -161,8 +163,11 @@ Real sound and the look have to be tried on a real PC:
 - [ ] "Start with Windows": turn it on, sign out and in again, the icon is
       back. Turn it off, sign out and in, it is gone.
 - [ ] "Quit" closes the app and the tray icon goes away.
-- [ ] RAM near zero when closed: open and close the window, wait a few
-      seconds, Task Manager's "Memory" column for Audio Lite is very small.
+- [ ] Open and close the window: 30 s later only one `audio-lite.exe` is
+      left in Task Manager, and opening and closing many times does not make
+      it grow. A click within those 30 s opens the window at once.
+- [ ] End the tray `audio-lite.exe` in Task Manager while the window is
+      open: the window goes away too.
 - [ ] The dark theme matches Brightness Lite (cards, blue sliders, round
       corners, font).
 - [ ] Start the app a second time: no second icon.

@@ -2,6 +2,19 @@
 
 What changed in each version, newest first.
 
+## 0.4.0
+
+- Two processes from the same exe: a small tray process (icon, tooltip,
+  hotkey, device switching; no window, no OpenGL) and a window process
+  that the tray starts on a click.
+- A closed window waits 30 s for the next click, then its process exits,
+  so all of its memory, the graphics driver's included, goes back to
+  Windows and cannot grow with every open and close. It also exits when
+  the tray process is gone.
+- CI: the cycle test starts, shows, hides and ends the window process 100
+  times and fails if the tray process grows by more than 1 MB or a window
+  process is left over.
+
 ## 0.3.1
 
 - The mouse wheel always scrolls the window, also over a slider or a mute

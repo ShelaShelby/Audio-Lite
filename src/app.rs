@@ -1,95 +1,100 @@
-//! Windows shell: tray icon (tray-icon), the hotkey (RegisterHotKey on a hidden
-//! window of the main thread), window show/hide (Win32 + DWM cloak) and the
-//! egui window. Same mechanics as Brightness Lite: the window is made once,
-//! hidden when closed, and 2 s after hiding its memory is given back to Windows.
+//! The window process (`--window`, started by the tray): the egui window with
+//! the audio engine. Window mechanics as in Brightness Lite: cloaked until its
+//! first frame is painted, so it never flickers. Hidden (X, Esc, click-away,
+//! a tray click) it waits 30 s for the next click with nothing running, then
+//! the process exits, and all its memory, OpenGL included, goes back to
+//! Windows. It also exits as soon as the tray process is gone.
 
+use crate::args::WindowArgs;
 use crate::engine::Engine;
+use crate::lifetime::{Do, Lifetime, LINGER};
+use crate::place::{self, Area, EDGE};
+use crate::proto::{self, HotkeyStatus};
 use crate::settings::{self, Settings};
 use crate::ui::{self, Action};
-use crate::{autostart, cycle, icon};
+use crate::{autostart, cycle, icon, tray};
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::ProcessStatus::{
-    EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcessId, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
 };
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, VK_LBUTTON, VK_MBUTTON,
-    VK_RBUTTON,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, GetWindowRect, IsWindowVisible, PostMessageW, RegisterClassW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, HWND_MESSAGE, HWND_TOPMOST, SPI_GETWORKAREA,
-    SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WM_APP,
-    WM_HOTKEY, WNDCLASSW, WS_OVERLAPPED,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GetWindowRect,
+    GetWindowThreadProcessId, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW, SendMessageTimeoutW,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, HWND_MESSAGE, HWND_TOPMOST,
+    SMTO_ABORTIFHUNG, SMTO_BLOCK, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
-const HOTKEY_ID: i32 = 1;
-/// From the audio thread: the model changed (update the tooltip).
-const WM_MODEL: u32 = WM_APP + 1;
+/// The window process's message window (the tray's clicks come here).
+const CLASS: PCWSTR = w!("AudioLiteWindow");
 /// While the window is open, read the volumes again this often, for anything
 /// the change events missed. Changes made elsewhere normally come as events.
 const POLL_EVERY: Duration = Duration::from_secs(3);
-/// Gap between the window and the screen edge (and the taskbar).
-const EDGE: i32 = 8;
+/// Safety net: a shown window is uncloaked after this long even without a painted frame.
+const UNCLOAK_AFTER: Duration = Duration::from_millis(300);
+/// The timer that ends the process after the window was hidden for a while.
+const EXIT_TIMER: usize = 1;
+/// How long the window waits for the tray to answer.
+const TRAY_TIMEOUT_MS: u32 = 2000;
 
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
-/// The hidden message window on the main thread (hotkey, tooltip updates).
+/// This process's message window.
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
+/// The tray's message window.
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
-static ENGINE: OnceLock<Arc<Engine>> = OnceLock::new();
+static ENGINE: OnceLock<std::sync::Arc<Engine>> = OnceLock::new();
+/// Middle of the tray icon of the last click: the window opens on its monitor.
+static AT: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 /// Set when the window is opened; the next frame resets focus tracking.
 static JUST_OPENED: AtomicBool = AtomicBool::new(false);
-/// When the window last hid itself because it lost focus.
-static FOCUS_HIDE: Mutex<Option<Instant>> = Mutex::new(None);
 /// Set at the end of the first update call: egui has painted its first frame.
 static FIRST_FRAME: AtomicBool = AtomicBool::new(false);
 /// True once that frame is done and the window is hidden again. Only then may it be shown.
 static READY: AtomicBool = AtomicBool::new(false);
-/// A tray click that came before READY; the window opens as soon as it is ready.
+/// Asked to show before READY; the window opens as soon as it is ready.
 static PENDING_OPEN: AtomicBool = AtomicBool::new(false);
 /// Just shown: wait for one painted frame, then uncloak.
 static AWAIT_FRAME: AtomicBool = AtomicBool::new(false);
 static UNCLOAK_NOW: AtomicBool = AtomicBool::new(false);
 /// The tray icon could not be made: the window stays open and its close button quits.
 static NO_TRAY: AtomicBool = AtomicBool::new(false);
-/// A tray click that follows a click-away hide must not reopen the window.
-const REOPEN_GUARD: Duration = Duration::from_millis(400);
-/// Safety net: a shown window is uncloaked after this long even without a painted frame.
-const UNCLOAK_AFTER: Duration = Duration::from_millis(300);
-/// After the window hides, give its memory back to Windows after this long.
-const TRIM_AFTER: Duration = Duration::from_secs(2);
 
-/// Settings and hotkey state. Main thread only (window, tray and hotkey all run there).
+/// Settings as the window shows them. Main thread only.
 struct Prefs {
     settings: Settings,
     path: Option<PathBuf>,
-    /// The hotkey registered now, if any.
-    registered: Option<String>,
+    /// The tray's answer about the hotkey (None: it did not answer).
+    status: Option<HotkeyStatus>,
+    /// The last change in the window went wrong (hotkey refused, file not saved).
     hotkey_error: Option<String>,
     startup: bool,
     startup_error: Option<String>,
-    tooltip: String,
 }
 
 thread_local! {
-    // Tray objects are not Send; the tray handlers run on this (main) thread.
-    static TRAY: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
     static PREFS: RefCell<Option<Prefs>> = const { RefCell::new(None) };
+    static LIFE: RefCell<Lifetime> = RefCell::new(Lifetime::new(LINGER));
 }
 
 fn with_prefs<R>(f: impl FnOnce(&mut Prefs) -> R) -> Option<R> {
     PREFS.with(|p| p.try_borrow_mut().ok().and_then(|mut p| p.as_mut().map(f)))
+}
+
+fn with_life<R>(f: impl FnOnce(&mut Lifetime) -> R) -> R {
+    LIFE.with(|l| f(&mut l.borrow_mut()))
 }
 
 fn engine() -> &'static Engine {
@@ -104,6 +109,10 @@ fn msg_hwnd() -> HWND {
     HWND(MSG_HWND.load(Ordering::Relaxed) as *mut _)
 }
 
+fn tray_hwnd() -> HWND {
+    HWND(TRAY_HWND.load(Ordering::Relaxed) as *mut _)
+}
+
 fn repaint() {
     if let Some(c) = CTX.get() {
         c.request_repaint();
@@ -112,90 +121,86 @@ fn repaint() {
 
 /// Called on the audio thread after it read the audio state again.
 fn model_changed() {
+    // Nothing is drawn while the window is hidden.
+    if window_visible() {
+        repaint();
+    }
+}
+
+// ---- talking to the tray ----
+
+/// Ask the tray and wait for its answer (0: no answer). The tray never waits
+/// for this window while it answers, so blocking here cannot deadlock.
+fn tray_send(msg: u32, wp: usize) -> isize {
+    let mut answer = 0usize;
+    let r = unsafe {
+        SendMessageTimeoutW(
+            tray_hwnd(),
+            msg,
+            WPARAM(wp),
+            LPARAM(0),
+            SMTO_BLOCK | SMTO_ABORTIFHUNG,
+            TRAY_TIMEOUT_MS,
+            Some(&mut answer),
+        )
+    };
+    if r.0 == 0 {
+        0
+    } else {
+        answer as isize
+    }
+}
+
+fn tray_post(msg: u32, wp: usize, lp: isize) {
     unsafe {
-        let _ = PostMessageW(msg_hwnd(), WM_MODEL, WPARAM(0), LPARAM(0));
-    }
-    // Nothing is drawn while the window is hidden.
-    if window_visible() {
-        repaint();
+        let _ = PostMessageW(tray_hwnd(), msg, WPARAM(wp), LPARAM(lp));
     }
 }
 
-/// Called on the audio thread after a volume or mute changed elsewhere.
-fn values_changed() {
-    // Nothing is drawn while the window is hidden.
-    if window_visible() {
-        repaint();
+/// The tray's message window, if it belongs to the process `pid`.
+fn find_tray(pid: u32) -> Option<HWND> {
+    let mut after = HWND::default();
+    loop {
+        let h = unsafe { FindWindowExW(HWND_MESSAGE, after, tray::CLASS, PCWSTR::null()) }.ok()?;
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut owner)) };
+        if owner == pid {
+            return Some(h);
+        }
+        after = h;
     }
 }
 
-// ---- one reusable timer thread (no thread per show) ----
+// ---- one reusable timer thread for the uncloak safety net ----
 
-/// Things to do later. Set from any thread; done by the timer thread.
-struct Due {
-    uncloak: Option<Instant>,
-    trim: Option<Instant>,
-}
+static UNCLOAK_AT: Mutex<Option<Instant>> = Mutex::new(None);
+static UNCLOAK_CHANGED: Condvar = Condvar::new();
 
-static DUE: Mutex<Due> = Mutex::new(Due { uncloak: None, trim: None });
-static DUE_CHANGED: Condvar = Condvar::new();
-
-fn schedule(f: impl FnOnce(&mut Due)) {
-    let mut d = DUE.lock().unwrap_or_else(|e| e.into_inner());
-    f(&mut d);
-    DUE_CHANGED.notify_one();
+fn schedule_uncloak(at: Option<Instant>) {
+    *UNCLOAK_AT.lock().unwrap_or_else(|e| e.into_inner()) = at;
+    UNCLOAK_CHANGED.notify_one();
 }
 
 fn start_timer() {
     std::thread::spawn(|| loop {
         // Never hold the lock during a Win32 call: the window thread may be
-        // waiting for it in schedule() while that call waits for the window thread.
-        let (uncloak, trim) = {
-            let mut d = DUE.lock().unwrap_or_else(|e| e.into_inner());
+        // waiting for it in schedule_uncloak() while that call waits for the window thread.
+        {
+            let mut at = UNCLOAK_AT.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 let now = Instant::now();
-                let uncloak = d.uncloak.is_some_and(|t| t <= now);
-                let trim = d.trim.is_some_and(|t| t <= now);
-                if uncloak || trim {
-                    if uncloak {
-                        d.uncloak = None;
+                match *at {
+                    Some(t) if t <= now => {
+                        *at = None;
+                        break;
                     }
-                    if trim {
-                        d.trim = None;
-                    }
-                    break (uncloak, trim);
+                    Some(t) => at = UNCLOAK_CHANGED.wait_timeout(at, t - now).unwrap_or_else(|e| e.into_inner()).0,
+                    None => at = UNCLOAK_CHANGED.wait(at).unwrap_or_else(|e| e.into_inner()),
                 }
-                d = match [d.uncloak, d.trim].into_iter().flatten().min() {
-                    Some(t) => DUE_CHANGED.wait_timeout(d, t - now).unwrap_or_else(|e| e.into_inner()).0,
-                    None => DUE_CHANGED.wait(d).unwrap_or_else(|e| e.into_inner()),
-                };
             }
-        };
-        if uncloak {
-            cloak(false);
         }
-        if trim && !window_visible() {
-            trim_working_set();
-        }
+        cloak(false);
     });
-}
-
-/// Let Windows take back the pages of a hidden window. This only lowers the
-/// number Task Manager shows (the working set); pages are read back in when
-/// the window is opened again. It frees no memory and fixes no leak.
-fn trim_working_set() {
-    unsafe {
-        let _ = EmptyWorkingSet(GetCurrentProcess());
-    }
-}
-
-/// (PrivateUsage, WorkingSetSize) in bytes.
-fn memory_info() -> Option<(usize, usize)> {
-    let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
-    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, size) }
-        .ok()?;
-    Some((c.PrivateUsage, c.WorkingSetSize))
 }
 
 // ---- show / hide the window (plain Win32, works while egui is idle) ----
@@ -208,33 +213,54 @@ fn cloak(on: bool) {
     }
 }
 
-fn work_area() -> RECT {
+/// The work area of the monitor with the tray icon (the main one if unknown).
+fn work_area() -> Area {
+    let at = *AT.lock().unwrap_or_else(|e| e.into_inner());
     let mut wa = RECT::default();
     unsafe {
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut wa as *mut _ as *mut _),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
+        let mut found = false;
+        if let Some((x, y)) = at {
+            let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                wa = mi.rcWork;
+                found = true;
+            }
+        }
+        if !found {
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut wa as *mut _ as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+        }
     }
-    wa
+    Area { left: wa.left, top: wa.top, right: wa.right, bottom: wa.bottom }
 }
 
-/// Bottom right corner of the work area, next to the tray. Also called when
-/// the window changed its height, so it never grows below the taskbar.
+/// In the corner of the work area next to the tray. Also called when the
+/// window changed its height, so it never grows below the taskbar.
 fn place_window() {
     unsafe {
         let h = hwnd();
-        let wa = work_area();
         let mut r = RECT::default();
         let _ = GetWindowRect(h, &mut r);
-        let (w, hh) = (r.right - r.left, r.bottom - r.top);
-        let (x, y) = (wa.right - w - EDGE, (wa.bottom - hh - EDGE).max(wa.top));
+        let at = *AT.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = place::place(work_area(), (r.right - r.left, r.bottom - r.top), at);
         if (r.left, r.top) != (x, y) {
             let _ = SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
+}
+
+/// Read settings.json and the tray's hotkey again (the window shows them as they are now).
+fn load_prefs(p: &mut Prefs) {
+    let text = p.path.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
+    p.settings = settings::parse(text.as_deref());
+    p.status = proto::decode(tray_send(proto::TRAY_STATUS, 0));
+    p.hotkey_error = None;
+    p.startup = autostart::enabled();
 }
 
 fn show_window() {
@@ -244,18 +270,19 @@ fn show_window() {
         repaint();
         return;
     }
+    with_life(|l| l.shown());
+    unsafe {
+        let _ = KillTimer(msg_hwnd(), EXIT_TIMER);
+    }
     engine().set_live(true);
     engine().refresh();
-    with_prefs(|p| p.startup = autostart::enabled());
+    with_prefs(load_prefs);
     // Cloaked while it appears, uncloaked after one painted frame, so the
     // window is never on screen before its dark content is.
     cloak(true);
     AWAIT_FRAME.store(true, Ordering::Relaxed);
-    // Safety net: never leave the window cloaked. Shown again: no trim.
-    schedule(|d| {
-        d.uncloak = Some(Instant::now() + UNCLOAK_AFTER);
-        d.trim = None;
-    });
+    // Safety net: never leave the window cloaked.
+    schedule_uncloak(Some(Instant::now() + UNCLOAK_AFTER));
     unsafe {
         place_window();
         let h = hwnd();
@@ -270,19 +297,45 @@ fn show_window() {
     }
 }
 
-fn hide_window() {
+/// Hide the window (`click_away`: it lost the focus). From now on nothing runs
+/// until the next tray click or the exit timer.
+fn hide_window(click_away: bool) {
     unsafe {
         let _ = ShowWindow(hwnd(), SW_HIDE);
     }
     engine().set_live(false);
-    // A hotkey change left half done: put the old hotkey back.
+    // A hotkey change left half done: the tray takes the saved hotkey again.
     with_prefs(|p| {
-        if p.registered.is_none() {
-            let text = p.settings.hotkey.clone();
-            register_hotkey(p, &text);
+        if p.status.is_some_and(|s| s.paused) {
+            p.status = proto::decode(tray_send(proto::TRAY_HOTKEY, 0));
         }
     });
-    schedule(|d| d.trim = Some(Instant::now() + TRIM_AFTER));
+    with_life(|l| l.hidden(Instant::now(), click_away));
+    tray_post(proto::TRAY_SHOWN, 0, 0);
+    arm_exit_timer();
+}
+
+fn arm_exit_timer() {
+    if NO_TRAY.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(t) = with_life(|l| l.deadline()) {
+        let ms = t.saturating_duration_since(Instant::now()).as_millis().clamp(1, u32::MAX as u128) as u32;
+        unsafe {
+            SetTimer(msg_hwnd(), EXIT_TIMER, ms, None);
+        }
+    }
+}
+
+/// The end of this process. Main thread only. Once the message window is
+/// gone the tray cannot reach this process any more, so its next click starts
+/// a new one (which waits for the window mutex until this one is gone).
+fn exit_process() -> ! {
+    unsafe {
+        let _ = DestroyWindow(msg_hwnd());
+    }
+    engine().quit();
+    std::process::exit(0);
 }
 
 fn window_visible() -> bool {
@@ -293,21 +346,10 @@ fn mouse_button_down() -> bool {
     unsafe { [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].iter().any(|k| (GetAsyncKeyState(k.0 as i32) as u16) & 0x8000 != 0) }
 }
 
-fn toggle_window() {
-    if window_visible() {
-        hide_window();
-    } else {
-        let just_hid = FOCUS_HIDE.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed() < REOPEN_GUARD);
-        if !just_hid {
-            show_window();
-        }
-    }
-}
-
+/// Quit was clicked (or the X without a tray icon): the tray goes too.
 fn quit() -> ! {
-    engine().quit();
-    TRAY.with(|t| t.borrow_mut().take()); // removes the tray icon
-    std::process::exit(0);
+    tray_post(proto::TRAY_QUIT, 0, 0);
+    exit_process();
 }
 
 // ---- settings and hotkey ----
@@ -317,104 +359,80 @@ fn save_settings(p: &Prefs) -> Option<String> {
     settings::save(path, &p.settings).err().map(|e| format!("Could not save settings.json: {e}"))
 }
 
-fn unregister_hotkey(p: &mut Prefs) {
-    unsafe {
-        let _ = UnregisterHotKey(msg_hwnd(), HOTKEY_ID);
-    }
-    p.registered = None;
-}
-
-/// Register `text` as the hotkey (after letting go of the old one).
-fn register_hotkey(p: &mut Prefs, text: &str) -> bool {
-    unregister_hotkey(p);
-    let Some((mods, vk)) = settings::parse_hotkey(text) else { return false };
-    let ok = unsafe { RegisterHotKey(msg_hwnd(), HOTKEY_ID, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) }.is_ok();
-    if ok {
-        p.registered = Some(text.to_string());
-    }
-    ok
-}
-
-/// The hotkey from settings.json at start. An unknown one falls back to the default.
-fn register_saved_hotkey(p: &mut Prefs) {
-    let mut text = p.settings.hotkey.clone();
-    p.hotkey_error = None;
-    if settings::parse_hotkey(&text).is_none() {
-        p.hotkey_error =
-            Some(format!("Unknown hotkey \"{text}\" in settings.json, using {}.", settings::DEFAULT_HOTKEY));
-        text = settings::DEFAULT_HOTKEY.to_string();
-        p.settings.hotkey = text.clone();
-    }
-    if !register_hotkey(p, &text) {
-        p.hotkey_error = Some(format!("{text} is already used by another program."));
-    }
-}
-
-/// A new combination from the window: keep it only if Windows takes it.
+/// A new combination from the window. settings.json gets it, and the tray
+/// registers it; if another program has it, the file and the hotkey stay as they were.
 fn change_hotkey(p: &mut Prefs, text: &str) {
-    if register_hotkey(p, text) {
-        p.hotkey_error = None;
-        if p.settings.hotkey != text {
-            p.settings.hotkey = text.to_string();
-            p.hotkey_error = save_settings(p);
+    p.hotkey_error = None;
+    if p.settings.hotkey == text {
+        // The same combination again: just take it back.
+        p.status = proto::decode(tray_send(proto::TRAY_HOTKEY, 0));
+        return;
+    }
+    let before = std::mem::replace(&mut p.settings.hotkey, text.to_string());
+    if let Some(e) = save_settings(p) {
+        p.settings.hotkey = before;
+        p.hotkey_error = Some(e);
+        p.status = proto::decode(tray_send(proto::TRAY_HOTKEY, 0));
+        return;
+    }
+    p.status = proto::decode(tray_send(proto::TRAY_RELOAD, 0));
+    if p.status.is_none_or(|s| s.refused) {
+        let (old, _) = proto::wanted_hotkey(&before);
+        p.settings.hotkey = before;
+        let _ = save_settings(p);
+        if p.status.is_some() {
+            p.hotkey_error = Some(format!("{text} is already used by another program. Kept {old}."));
         }
-    } else {
-        let old = p.settings.hotkey.clone();
-        register_hotkey(p, &old);
-        p.hotkey_error = Some(format!("{text} is already used by another program. Kept {old}."));
-    }
-}
-
-fn update_tooltip(p: &mut Prefs) {
-    let m = engine().model();
-    let mut tip =
-        format!("Audio Lite: {}", if m.default_name.is_empty() { "No playback device" } else { &m.default_name });
-    for n in m.note.iter().chain(&p.hotkey_error) {
-        tip.push('\n');
-        tip.push_str(n);
-    }
-    if tip != p.tooltip {
-        TRAY.with(|t| {
-            if let Some(t) = t.borrow().as_ref() {
-                let _ = t.set_tooltip(Some(&tip));
-            }
-        });
-        p.tooltip = tip;
     }
 }
 
 unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_HOTKEY if wp.0 as i32 == HOTKEY_ID => {
-            if let Some(ex) = with_prefs(|p| p.settings.exclude.clone()) {
-                engine().cycle(ex);
+        proto::WINDOW_OPEN => {
+            let Some(ask) = proto::ask_from(wp.0) else { return LRESULT(0) };
+            if wp.0 & proto::HAS_POINT != 0 {
+                *AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(proto::unpack_point(lp.0));
             }
-            LRESULT(0)
+            // None: this process is exiting; the tray starts a new one.
+            match with_life(|l| l.ask(ask, Instant::now())) {
+                None => LRESULT(0),
+                Some(Do::Show) => {
+                    show_window();
+                    LRESULT(proto::OPEN_SHOWN)
+                }
+                Some(Do::Hide) => {
+                    hide_window(false);
+                    LRESULT(proto::OPEN_HIDDEN)
+                }
+                Some(Do::Nothing) => LRESULT(proto::OPEN_NOTHING),
+            }
         }
-        WM_MODEL => {
-            with_prefs(update_tooltip);
+        WM_TIMER if wp.0 == EXIT_TIMER => {
+            let _ = KillTimer(hwnd, EXIT_TIMER);
+            if with_life(|l| l.expire(Instant::now())) {
+                exit_process();
+            }
+            arm_exit_timer();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
-/// A message-only window on the main thread: it owns the hotkey and hears from the audio thread.
 fn create_msg_window() -> bool {
     unsafe {
         let Ok(module) = GetModuleHandleW(None) else { return false };
-        let class = w!("AudioLiteMessages");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(msg_proc),
             hInstance: module.into(),
-            lpszClassName: class,
+            lpszClassName: CLASS,
             ..Default::default()
         };
         RegisterClassW(&wc);
         match CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            class,
-            w!("Audio Lite messages"),
+            CLASS,
+            w!("Audio Lite window"),
             WS_OVERLAPPED,
             0,
             0,
@@ -454,18 +472,18 @@ impl AudioApp {
                 with_prefs(|p| {
                     if cycle::set_in_cycle(&mut p.settings.exclude, &name, on) {
                         p.hotkey_error = save_settings(p);
+                        if p.hotkey_error.is_none() {
+                            p.status = proto::decode(tray_send(proto::TRAY_RELOAD, 0));
+                        }
                     }
                 });
             }
             // The old combination must not fire while the new one is typed.
             Action::RecordHotkey => {
-                with_prefs(unregister_hotkey);
+                with_prefs(|p| p.status = proto::decode(tray_send(proto::TRAY_HOTKEY, 1)));
             }
             Action::CancelHotkey => {
-                with_prefs(|p| {
-                    let old = p.settings.hotkey.clone();
-                    register_hotkey(p, &old);
-                });
+                with_prefs(|p| p.status = proto::decode(tray_send(proto::TRAY_HOTKEY, 0)));
             }
             Action::Hotkey(text) => {
                 with_prefs(|p| change_hotkey(p, &text));
@@ -491,21 +509,25 @@ impl eframe::App for AudioApp {
                 quit();
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            hide_window();
+            hide_window(false);
         }
 
         // First frame is done: hide the window again (eframe shows it after the
-        // first paint) and from now on allow opening it.
+        // first paint), tell the tray this process is there, and open it.
         if !READY.load(Ordering::Relaxed) && FIRST_FRAME.load(Ordering::Relaxed) {
-            hide_window(); // also trims once, a moment later
+            unsafe {
+                let _ = ShowWindow(hwnd(), SW_HIDE);
+            }
             cloak(false);
             READY.store(true, Ordering::Relaxed);
-            if NO_TRAY.load(Ordering::Relaxed) || PENDING_OPEN.swap(false, Ordering::Relaxed) {
-                show_window();
-            }
+            tray_post(proto::TRAY_HELLO, unsafe { GetCurrentProcessId() } as usize, msg_hwnd().0 as isize);
+            PENDING_OPEN.store(false, Ordering::Relaxed);
+            show_window();
         }
         if UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
+            schedule_uncloak(None);
             cloak(false);
+            tray_post(proto::TRAY_SHOWN, 1, 0);
         }
 
         if JUST_OPENED.swap(false, Ordering::Relaxed) {
@@ -542,10 +564,7 @@ impl eframe::App for AudioApp {
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
                 self.armed = false;
-                if let Ok(mut g) = FOCUS_HIDE.lock() {
-                    *g = Some(Instant::now());
-                }
-                hide_window();
+                hide_window(true);
             }
         }
     }
@@ -558,9 +577,10 @@ impl eframe::App for AudioApp {
         let max_h = ((wa.bottom - wa.top - 2 * EDGE) as f32 / ppp - 40.0).max(200.0);
         let was_recording = self.ui.recording;
         let actions = with_prefs(|p| {
+            let (hotkey, problem) = proto::hotkey_view(&p.settings.hotkey, p.status);
             let info = ui::Info {
-                hotkey: p.registered.as_deref().unwrap_or(&p.settings.hotkey),
-                hotkey_error: p.hotkey_error.as_deref(),
+                hotkey: &hotkey,
+                hotkey_error: p.hotkey_error.as_deref().or(problem.as_deref()),
                 excluded: &p.settings.exclude,
                 startup: p.startup,
                 startup_error: p.startup_error.as_deref(),
@@ -573,8 +593,12 @@ impl eframe::App for AudioApp {
             self.act(a);
         }
         // Esc closes the window (while recording a hotkey it only cancels that).
-        if !was_recording && ui.input(|i| i.key_pressed(egui::Key::Escape)) && !NO_TRAY.load(Ordering::Relaxed) {
-            hide_window();
+        if !was_recording
+            && ui.input(|i| i.key_pressed(egui::Key::Escape))
+            && !NO_TRAY.load(Ordering::Relaxed)
+            && window_visible()
+        {
+            hide_window(false);
         }
 
         // Flags for the next logic() call, which runs after this frame is painted.
@@ -594,135 +618,65 @@ impl eframe::App for AudioApp {
     }
 }
 
-// ---- tray ----
-
-/// Make the tray icon. Left click opens or closes the window; there is no menu.
-/// False if Windows refused (then the window stays open).
-fn create_tray() -> bool {
-    let mut builder = TrayIconBuilder::new().with_tooltip("Audio Lite");
-    if let Ok(icon) = Icon::from_rgba(icon::rgba(32), 32, 32) {
-        builder = builder.with_icon(icon);
+/// Only one window process at a time: wait (up to 5 s) for one that is still
+/// exiting. The handle must stay alive for as long as the process runs.
+fn window_lock() -> Option<HANDLE> {
+    unsafe {
+        let h = CreateMutexW(None, false, w!("Local\\AudioLite-window")).ok()?;
+        let r = WaitForSingleObject(h, 5000);
+        (r == WAIT_OBJECT_0 || r == WAIT_ABANDONED).then_some(h)
     }
-    // If the taskbar is not there yet (early at login), tray-icon adds the icon
-    // when it appears. An error here means the tray window itself could not be made.
-    let Ok(tray) = builder.build() else { return false };
-    TRAY.with(|t| *t.borrow_mut() = Some(tray));
+}
 
-    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-            toggle_window();
+/// Exit as soon as the tray process is gone (killed, crashed or quit).
+fn watch_parent(pid: u32) -> bool {
+    let Ok(h) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else { return false };
+    let raw = h.0 as isize;
+    std::thread::spawn(move || {
+        unsafe { WaitForSingleObject(HANDLE(raw as *mut _), INFINITE) };
+        if let Some(e) = ENGINE.get() {
+            e.quit();
         }
-    }));
+        std::process::exit(0);
+    });
     true
 }
 
-// ---- --cycle-test N: open and hide the window N times, print the memory use ----
-
-fn cycle_test_arg() -> Option<u32> {
-    let args: Vec<String> = std::env::args().collect();
-    let i = args.iter().position(|a| a == "--cycle-test")?;
-    args.get(i + 1).and_then(|n| n.parse().ok()).filter(|n| *n > 0)
-}
-
-/// Printed to stdout and appended to cycle-test.log in the current folder
-/// (this is a GUI program, so stdout may go nowhere).
-fn report(line: &str) {
-    use std::io::Write;
-    println!("{line}");
-    let _ = std::io::stdout().flush();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("cycle-test.log") {
-        let _ = writeln!(f, "{line}");
-    }
-}
-
-fn report_memory(label: &str) {
-    match memory_info() {
-        Some((private, ws)) => report(&format!(
-            "{label:>10}  PrivateUsage {:8.2} MB  WorkingSetSize {:8.2} MB",
-            private as f64 / 1048576.0,
-            ws as f64 / 1048576.0
-        )),
-        None => report(&format!("{label:>10}  GetProcessMemoryInfo failed")),
-    }
-}
-
-/// Runs beside the window: waits until it can be opened, then opens and hides
-/// it `n` times about 50 ms apart, like a user clicking the tray icon.
-fn start_cycle_test(n: u32) {
-    std::thread::spawn(move || {
-        let t0 = Instant::now();
-        while !READY.load(Ordering::Relaxed) {
-            if t0.elapsed() > Duration::from_secs(60) {
-                report("cycle-test: the window was not ready after 60 s");
-                std::process::exit(2);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        // Let the startup trim (2 s after the first hide) happen first.
-        std::thread::sleep(TRIM_AFTER + Duration::from_secs(1));
-        report(&format!("cycle-test: {n} open/hide cycles"));
-        report_memory("cycle 0");
-        let marks = [n / 4, n / 2, n];
-        for c in 1..=n {
-            show_window();
-            std::thread::sleep(Duration::from_millis(50));
-            hide_window();
-            std::thread::sleep(Duration::from_millis(50));
-            if marks.contains(&c) {
-                report_memory(&format!("cycle {c}"));
-            }
-        }
-        std::thread::sleep(TRIM_AFTER + Duration::from_secs(1));
-        report_memory("+3 s idle");
-        engine().quit();
-        std::process::exit(0);
-    });
-}
-
-/// Take the named mutex. None means another copy already holds it.
-/// The returned handle must stay alive for as long as the app runs.
-fn single_instance(name: PCWSTR) -> Option<HANDLE> {
-    unsafe {
-        let handle = CreateMutexW(None, false, name).ok()?;
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            None
-        } else {
-            Some(handle)
-        }
-    }
-}
-
-pub fn run() {
-    // A second copy exits quietly.
-    let Some(_instance) = single_instance(w!("Local\\AudioLite-single-instance")) else {
+pub fn run(args: WindowArgs) {
+    let Some(_lock) = window_lock() else { return };
+    let Some(tray) = find_tray(args.parent) else { return };
+    TRAY_HWND.store(tray.0 as isize, Ordering::Relaxed);
+    if !watch_parent(args.parent) {
         return;
-    };
+    }
+    NO_TRAY.store(args.no_tray, Ordering::Relaxed);
+    *AT.lock().unwrap_or_else(|e| e.into_inner()) = args.at;
+    if let Some(ms) = args.linger_ms {
+        with_life(|l| *l = Lifetime::new(Duration::from_millis(ms)));
+    }
+    if !create_msg_window() {
+        return;
+    }
 
     // Starts the audio thread; the first read runs in the background.
-    let _ = ENGINE.set(Engine::start(model_changed, values_changed));
+    let _ = ENGINE.set(Engine::start(model_changed, model_changed));
 
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-    let path = settings::choose_path(exe_dir.as_deref(), appdata.as_deref(), |p| p.exists());
-    let text = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
-    let prefs = Prefs {
-        settings: settings::parse(text.as_deref()),
-        path,
-        registered: None,
+    let mut prefs = Prefs {
+        settings: Settings::default(),
+        path: settings::choose_path(exe_dir.as_deref(), appdata.as_deref(), |p| p.exists()),
+        status: None,
         hotkey_error: None,
-        startup: autostart::enabled(),
+        startup: false,
         startup_error: None,
-        tooltip: String::new(),
     };
-    // Keep the Run entry pointing at this exe if it was moved.
-    if prefs.startup {
-        if let Ok(exe) = std::env::current_exe() {
-            let _ = autostart::refresh(&exe);
-        }
+    load_prefs(&mut prefs);
+    if args.no_tray {
+        prefs.startup_error = Some("The tray icon could not be made, so the window stays open.".into());
     }
     PREFS.with(|p| *p.borrow_mut() = Some(prefs));
 
-    let cycle_test = cycle_test_arg();
     let icon = egui::IconData { rgba: icon::rgba(32), width: 32, height: 32 };
     // No depth, stencil or multisampling buffers: egui needs none of them.
     let options = eframe::NativeOptions {
@@ -755,43 +709,14 @@ pub fn run() {
             }
             // eframe shows the window after its first paint; keep that invisible.
             cloak(true);
-            if create_msg_window() {
-                with_prefs(register_saved_hotkey);
-            } else {
-                with_prefs(|p| p.hotkey_error = Some("The hotkey could not be set up.".into()));
-            }
-            if !create_tray() {
-                NO_TRAY.store(true, Ordering::Relaxed);
-                with_prefs(|p| {
-                    p.startup_error = Some("The tray icon could not be made, so the window stays open.".into())
-                });
-            }
-            with_prefs(update_tooltip);
             start_timer();
-            if let Some(n) = cycle_test {
-                start_cycle_test(n);
-            }
             Ok(Box::new(AudioApp { ui: ui::UiState::default(), armed: false, last_poll: None }))
         }),
     );
     if let Err(e) = result {
         eprintln!("window error: {e}");
-        if cycle_test.is_some() {
-            report(&format!("cycle-test: the window could not be created: {e}"));
-            std::process::exit(2);
-        }
+        engine().quit();
+        std::process::exit(2);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn second_instance_is_refused() {
-        let name = w!("Local\\AudioLite-test-mutex");
-        let first = single_instance(name);
-        assert!(first.is_some());
-        assert!(single_instance(name).is_none());
-    }
+    exit_process();
 }
