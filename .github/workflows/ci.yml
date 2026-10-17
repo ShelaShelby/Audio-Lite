@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      # The runner has no sound card: these tests cover the logic, not real audio.
+      - name: Tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Binary size
+        shell: bash
+        run: |
+          size=$(wc -c < target/release/audio-lite.exe)
+          echo "audio-lite.exe: $size bytes"
+          echo "### Binary size: $size bytes" >> "$GITHUB_STEP_SUMMARY"

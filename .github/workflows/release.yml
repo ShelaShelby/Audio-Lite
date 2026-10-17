@@ -1,0 +1,87 @@
+name: Release
+
+# Runs on every push to main and by hand. If the tag v<version> from Cargo.toml
+# does not exist yet, builds the app and creates the tag and the release.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["README.md", "LICENSE"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.v.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A release or a tag for this version already exists: stop.
+          if gh release view "v$version" >/dev/null 2>&1 ||
+             git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "v$version already exists, nothing to do"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Collect the file
+        shell: bash
+        run: mkdir dist && cp target/release/audio-lite.exe dist/audio-lite.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/audio-lite.exe
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum audio-lite.exe > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create the tag and the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat > notes.md <<'NOTES'
+          Download `audio-lite.exe` (Windows 10/11, 64-bit). `SHA256SUMS` has its checksum.
+
+          NOTES
+          # The part of CHANGELOG.md for this version, if there is one.
+          awk -v v="## $VERSION" '$0 == v || index($0, v " ") == 1 {on=1; next} /^## /{on=0} on' CHANGELOG.md >> notes.md
+          echo "File size: $(wc -c < dist/audio-lite.exe) bytes." >> notes.md
+          gh release create "v$VERSION" dist/audio-lite.exe dist/SHA256SUMS \
+            --target "$SHA" \
+            --title "Audio Lite $VERSION" \
+            --notes-file notes.md
