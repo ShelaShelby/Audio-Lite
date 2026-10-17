@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -62,10 +64,9 @@ static AT: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 static JUST_OPENED: AtomicBool = AtomicBool::new(false);
 /// Set at the end of the first update call: egui has painted its first frame.
 static FIRST_FRAME: AtomicBool = AtomicBool::new(false);
-/// True once that frame is done and the window is hidden again. Only then may it be shown.
+/// True once that frame is done and the window is hidden again. Only then may
+/// it be shown (it opens by itself as soon as it is ready).
 static READY: AtomicBool = AtomicBool::new(false);
-/// Asked to show before READY; the window opens as soon as it is ready.
-static PENDING_OPEN: AtomicBool = AtomicBool::new(false);
 /// Just shown: wait for one painted frame, then uncloak.
 static AWAIT_FRAME: AtomicBool = AtomicBool::new(false);
 static UNCLOAK_NOW: AtomicBool = AtomicBool::new(false);
@@ -93,12 +94,15 @@ fn with_prefs<R>(f: impl FnOnce(&mut Prefs) -> R) -> Option<R> {
     PREFS.with(|p| p.try_borrow_mut().ok().and_then(|mut p| p.as_mut().map(f)))
 }
 
-fn with_life<R>(f: impl FnOnce(&mut Lifetime) -> R) -> R {
-    LIFE.with(|l| f(&mut l.borrow_mut()))
+/// None only if it is in use further up the stack (a Windows call that
+/// dispatched a message back here); never a double borrow.
+fn with_life<R>(f: impl FnOnce(&mut Lifetime) -> R) -> Option<R> {
+    LIFE.with(|l| l.try_borrow_mut().ok().map(|mut l| f(&mut l)))
 }
 
+/// The audio thread; started on first use, so this can never fail.
 fn engine() -> &'static Engine {
-    ENGINE.get().expect("audio thread started")
+    ENGINE.get_or_init(|| Engine::start(model_changed, model_changed))
 }
 
 fn hwnd() -> HWND {
@@ -182,7 +186,8 @@ fn schedule_uncloak(at: Option<Instant>) {
 }
 
 fn start_timer() {
-    std::thread::spawn(|| loop {
+    // Builder, not thread::spawn: that one panics (aborts) if Windows refuses a thread.
+    let _ = std::thread::Builder::new().spawn(|| loop {
         // Never hold the lock during a Win32 call: the window thread may be
         // waiting for it in schedule_uncloak() while that call waits for the window thread.
         {
@@ -256,8 +261,11 @@ fn place_window() {
 
 /// Read settings.json and the tray's hotkey again (the window shows them as they are now).
 fn load_prefs(p: &mut Prefs) {
-    let text = p.path.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
-    p.settings = settings::parse(text.as_deref());
+    // Not readable right now: keep what was shown, so a change made next does
+    // not write the defaults over the real file.
+    if let Ok(text) = settings::read(p.path.as_deref()) {
+        p.settings = settings::parse(text.as_deref());
+    }
     p.status = proto::decode(tray_send(proto::TRAY_STATUS, 0));
     p.hotkey_error = None;
     p.startup = autostart::enabled();
@@ -265,8 +273,7 @@ fn load_prefs(p: &mut Prefs) {
 
 fn show_window() {
     if !READY.load(Ordering::Relaxed) {
-        // The first frame is not painted yet: open as soon as it is.
-        PENDING_OPEN.store(true, Ordering::Relaxed);
+        // The first frame is not painted yet: it opens as soon as it is.
         repaint();
         return;
     }
@@ -283,6 +290,9 @@ fn show_window() {
     AWAIT_FRAME.store(true, Ordering::Relaxed);
     // Safety net: never leave the window cloaked.
     schedule_uncloak(Some(Instant::now() + UNCLOAK_AFTER));
+    // Before ShowWindow: a frame drawn while it shows must already see the window
+    // as just opened, or a focus change from the last time could hide it at once.
+    JUST_OPENED.store(true, Ordering::Relaxed);
     unsafe {
         place_window();
         let h = hwnd();
@@ -290,7 +300,6 @@ fn show_window() {
         let _ = BringWindowToTop(h);
         let _ = SetForegroundWindow(h);
     }
-    JUST_OPENED.store(true, Ordering::Relaxed);
     if let Some(c) = CTX.get() {
         c.send_viewport_cmd(egui::ViewportCommand::Focus);
         c.request_repaint();
@@ -319,7 +328,7 @@ fn arm_exit_timer() {
     if NO_TRAY.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(t) = with_life(|l| l.deadline()) {
+    if let Some(t) = with_life(|l| l.deadline()).flatten() {
         let ms = t.saturating_duration_since(Instant::now()).as_millis().clamp(1, u32::MAX as u128) as u32;
         unsafe {
             SetTimer(msg_hwnd(), EXIT_TIMER, ms, None);
@@ -334,7 +343,9 @@ fn exit_process() -> ! {
     unsafe {
         let _ = DestroyWindow(msg_hwnd());
     }
-    engine().quit();
+    if let Some(e) = ENGINE.get() {
+        e.quit();
+    }
     std::process::exit(0);
 }
 
@@ -393,8 +404,9 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             if wp.0 & proto::HAS_POINT != 0 {
                 *AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(proto::unpack_point(lp.0));
             }
-            // None: this process is exiting; the tray starts a new one.
-            match with_life(|l| l.ask(ask, Instant::now())) {
+            // None: this process is exiting; the tray starts a new one. Busy
+            // (never expected): the click does nothing, rather than a second process.
+            match with_life(|l| l.ask(ask, Instant::now())).unwrap_or(Some(Do::Nothing)) {
                 None => LRESULT(0),
                 Some(Do::Show) => {
                     show_window();
@@ -409,7 +421,7 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         WM_TIMER if wp.0 == EXIT_TIMER => {
             let _ = KillTimer(hwnd, EXIT_TIMER);
-            if with_life(|l| l.expire(Instant::now())) {
+            if with_life(|l| l.expire(Instant::now())).unwrap_or(false) {
                 exit_process();
             }
             arm_exit_timer();
@@ -521,7 +533,6 @@ impl eframe::App for AudioApp {
             cloak(false);
             READY.store(true, Ordering::Relaxed);
             tray_post(proto::TRAY_HELLO, unsafe { GetCurrentProcessId() } as usize, msg_hwnd().0 as isize);
-            PENDING_OPEN.store(false, Ordering::Relaxed);
             show_window();
         }
         if UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
@@ -632,13 +643,19 @@ fn window_lock() -> Option<HANDLE> {
 fn watch_parent(pid: u32) -> bool {
     let Ok(h) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else { return false };
     let raw = h.0 as isize;
-    std::thread::spawn(move || {
+    let watching = std::thread::Builder::new().spawn(move || {
         unsafe { WaitForSingleObject(HANDLE(raw as *mut _), INFINITE) };
         if let Some(e) = ENGINE.get() {
             e.quit();
         }
         std::process::exit(0);
     });
+    if watching.is_err() {
+        unsafe {
+            let _ = CloseHandle(h);
+        }
+        return false;
+    }
     true
 }
 
@@ -659,7 +676,7 @@ pub fn run(args: WindowArgs) {
     }
 
     // Starts the audio thread; the first read runs in the background.
-    let _ = ENGINE.set(Engine::start(model_changed, model_changed));
+    let _ = engine();
 
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
@@ -714,7 +731,9 @@ pub fn run(args: WindowArgs) {
         }),
     );
     if let Err(e) = result {
-        eprintln!("window error: {e}");
+        use std::io::Write;
+        // Never eprintln!: it panics (and so aborts) if stderr is a closed pipe.
+        let _ = writeln!(std::io::stderr(), "window error: {e}");
         engine().quit();
         std::process::exit(2);
     }

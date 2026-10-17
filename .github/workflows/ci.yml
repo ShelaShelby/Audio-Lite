@@ -53,3 +53,22 @@ jobs:
           fi
           grep -q "+3 s idle" cycle-test.log || { echo "cycle test did not finish"; exit 1; }
           grep -q "cycle-test: PASS" cycle-test.log || { echo "cycle test failed"; exit 1; }
+      # Stress test: 200 times, click the tray icon (sometimes 2 or 3 times in a
+      # row), wait a random time (the window process is starting, painting,
+      # shown, hidden or exiting), sometimes hide it, then kill the window
+      # process. Fails if the tray dies, a window process is left over, or the
+      # tray holds more than 10 handles more than after round 5.
+      - name: Stress test (kill the window process at random times x200, handles)
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          if [ -f mesa/audio-lite.exe ]; then cd mesa; exe=./audio-lite.exe; else exe=./target/release/audio-lite.exe; fi
+          rm -f cycle-test.log
+          "$exe" --stress-test 200 || echo "exit code $?"
+          touch cycle-test.log && cat cycle-test.log
+          { echo "### Stress test"; echo '```'; cat cycle-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          grep -q "stress-test: PASS" cycle-test.log || { echo "stress test failed"; exit 1; }
+          sleep 2
+          if tasklist //FI "IMAGENAME eq audio-lite.exe" | grep -qi "audio-lite"; then
+            echo "audio-lite.exe is still running"; tasklist //FI "IMAGENAME eq audio-lite.exe"; exit 1
+          fi

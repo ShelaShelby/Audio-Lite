@@ -121,7 +121,10 @@ Where the file is:
 - Otherwise `%APPDATA%\Audio Lite\settings.json`.
 
 If the file is missing or broken, the app uses the defaults
-(Ctrl + Alt + A, every device in the cycle).
+(Ctrl + Alt + A, every device in the cycle). A field with the wrong type
+gets its default; the other field is still used. The window writes the
+file to a temporary file first and then renames it, so it is never left
+half written.
 
 ## Good to know
 
@@ -136,7 +139,8 @@ running. Please open an issue then.
 
 The automatic tests run on a GitHub machine without a sound card, so they
 check the logic only (and that the window process starts, shows, hides
-and exits 100 times without the tray process growing).
+and exits 100 times without the tray process growing, and that killing it
+at random moments 200 times leaves the tray running with no extra handles).
 Real sound and the look have to be tried on a real PC:
 
 - [ ] Left click on the tray icon opens the window; it closes with its X,
@@ -171,3 +175,5 @@ Real sound and the look have to be tried on a real PC:
 - [ ] The dark theme matches Brightness Lite (cards, blue sliders, round
       corners, font).
 - [ ] Start the app a second time: no second icon.
+- [ ] Restart Explorer (Task Manager, "Windows Explorer", Restart): the
+      tray icon comes back and a click still opens the window.

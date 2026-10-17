@@ -160,4 +160,22 @@ mod tests {
         set_entry(&name, false, Path::new("x")).unwrap();
         assert_eq!(read_run_value(&name), None);
     }
+
+    #[test]
+    fn unusual_paths_round_trip() {
+        let name = test_name("unicode");
+        for exe in [
+            "C:\\Program Files\\Audio Lite\\audio-lite.exe",
+            "D:\\Ünïcödé 音\\a b.exe",
+            "\\\\server\\share\\audio-lite.exe",
+        ] {
+            set_entry(&name, true, Path::new(exe)).unwrap();
+            assert_eq!(read_run_value(&name), Some(format!("\"{exe}\"")));
+            // Already right: nothing is written again.
+            refresh_entry(&name, Path::new(exe)).unwrap();
+            assert_eq!(read_run_value(&name), Some(format!("\"{exe}\"")));
+        }
+        set_entry(&name, false, Path::new("x")).unwrap();
+        assert_eq!(read_run_value(&name), None);
+    }
 }

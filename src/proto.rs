@@ -121,6 +121,10 @@ pub fn hotkey_view(text: &str, status: Option<HotkeyStatus>) -> (String, Option<
 /// Steps of the cycle test, as wParam of `TRAY_TEST`.
 pub const TEST_CLICK: usize = 1;
 pub const TEST_HIDE: usize = 2;
+/// A real tray click (toggle).
+pub const TEST_TOGGLE: usize = 3;
+/// Kill every window process (stress test).
+pub const TEST_KILL: usize = 4;
 
 #[cfg(test)]
 mod tests {

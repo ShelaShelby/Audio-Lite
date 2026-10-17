@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use windows::core::{IUnknown, Interface, BSTR, GUID, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, S_OK};
+use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE, S_OK};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
     eCommunications, eConsole, eMultimedia, eRender, AudioSessionStateExpired, IAudioSessionControl,
@@ -17,7 +17,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 #[allow(non_snake_case)]
@@ -204,7 +204,26 @@ fn exe_path(pid: u32) -> Option<String> {
         let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
         let _ = CloseHandle(h);
         r.ok()?;
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
+        Some(String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]))
+    }
+}
+
+/// True if no process has this id any more (its session is a leftover that
+/// Windows has not ended yet). False when it runs but cannot be read.
+fn process_gone(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => {
+            let mut code = 0u32;
+            let ended = unsafe { GetExitCodeProcess(h, &mut code) }.is_ok() && code != STILL_ACTIVE.0 as u32;
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            ended
+        }
+        Err(e) => e.code() == ERROR_INVALID_PARAMETER.to_hresult(),
     }
 }
 
@@ -299,7 +318,9 @@ pub fn session(control: &IAudioSessionControl, i: i32, names: &mut NameCache) ->
             description,
             display_name: control.GetDisplayName().ok().and_then(take_pwstr),
             system,
-            expired: control.GetState() == Ok(AudioSessionStateExpired),
+            // A session of a process that has ended is not shown (Windows keeps
+            // some of them for a while, they would be "Process 1234" rows).
+            expired: control.GetState() == Ok(AudioSessionStateExpired) || (!system && process_gone(pid)),
             volume: level,
             muted,
             handle: Handle { volume, control: control.clone() },

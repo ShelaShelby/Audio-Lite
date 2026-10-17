@@ -75,10 +75,11 @@ impl Lifetime {
         })
     }
 
-    /// When the process exits if nothing happens before.
+    /// When the process exits if nothing happens before (None also for a
+    /// linger too long for the clock: then it never exits by itself).
     pub fn deadline(&self) -> Option<Instant> {
         match (self.exiting, self.visible, self.hidden_at) {
-            (false, false, Some(t)) => Some(t + self.linger),
+            (false, false, Some(t)) => t.checked_add(self.linger),
             _ => None,
         }
     }
@@ -165,5 +166,78 @@ mod tests {
         let t1 = t0 + REOPEN_GUARD * 2;
         l.hidden(t1, false);
         assert_eq!(l.ask(Ask::Toggle, t1 + MS), Some(Do::Show));
+    }
+
+    #[test]
+    fn huge_linger_never_panics() {
+        let mut l = Lifetime::new(Duration::MAX);
+        let t0 = Instant::now();
+        l.shown();
+        l.hidden(t0, false);
+        assert_eq!(l.deadline(), None);
+        assert!(!l.expire(t0 + LINGER));
+        assert_eq!(l.ask(Ask::Toggle, t0 + LINGER), Some(Do::Show));
+    }
+
+    /// Random asks and events: the answers always fit the state, and once it
+    /// is exiting it stays exiting.
+    #[test]
+    fn random_sequences_keep_the_rules() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..500 {
+            let mut l = Lifetime::new(Duration::from_millis(1000));
+            let t0 = Instant::now();
+            let mut now = t0;
+            let mut shown = false;
+            let mut exiting = false;
+            for _ in 0..200 {
+                now += Duration::from_millis(next() % 700);
+                match next() % 6 {
+                    0 => {
+                        l.shown();
+                        shown = true;
+                    }
+                    1 | 2 => {
+                        l.hidden(now, next() % 2 == 0);
+                        shown = false;
+                    }
+                    3 => {
+                        if l.expire(now) {
+                            exiting = true;
+                        }
+                    }
+                    _ => {
+                        let ask = [Ask::Toggle, Ask::Show, Ask::Hide][(next() % 3) as usize];
+                        match l.ask(ask, now) {
+                            None => assert!(exiting),
+                            Some(d) => {
+                                assert!(!exiting);
+                                if shown {
+                                    assert_ne!(d, Do::Show);
+                                } else {
+                                    assert_ne!(d, Do::Hide);
+                                }
+                                if ask == Ask::Hide {
+                                    assert_ne!(d, Do::Show);
+                                }
+                            }
+                        }
+                    }
+                }
+                if exiting {
+                    assert_eq!(l.deadline(), None);
+                    assert!(l.expire(now));
+                }
+                if shown {
+                    assert_eq!(l.deadline(), None);
+                }
+            }
+        }
     }
 }

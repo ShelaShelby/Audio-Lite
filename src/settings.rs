@@ -1,15 +1,15 @@
 //! settings.json: the hotkey and the devices the hotkey skips.
 //! A missing or broken file gives the defaults. Pure parsing, no Windows calls.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "settings.json";
 pub const APP_DIR: &str = "Audio Lite";
 pub const DEFAULT_HOTKEY: &str = "Ctrl+Alt+A";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Settings {
     /// For example "Ctrl+Alt+A".
     pub hotkey: String,
@@ -24,8 +24,33 @@ impl Default for Settings {
 }
 
 /// Parse the file contents. `None` (no file) or broken JSON gives the defaults.
+/// Each field is read on its own: a field with the wrong type gets its default
+/// and the other one is still used. Unknown fields are ignored.
 pub fn parse(text: Option<&str>) -> Settings {
-    text.and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok()).unwrap_or_default()
+    let mut s = Settings::default();
+    let Some(Value::Object(map)) = text.and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
+    else {
+        return s;
+    };
+    if let Some(Value::String(h)) = map.get("hotkey") {
+        s.hotkey = h.clone();
+    }
+    if let Some(Value::Array(list)) = map.get("exclude") {
+        s.exclude =
+            list.iter().filter_map(Value::as_str).filter(|n| !n.trim().is_empty()).map(str::to_string).collect();
+    }
+    s
+}
+
+/// The text of the file. `Ok(None)`: there is no file (or no path). `Err`: it
+/// exists but could not be read right now; then the settings in use are kept.
+pub fn read(path: Option<&Path>) -> std::io::Result<Option<String>> {
+    let Some(path) = path else { return Ok(None) };
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn to_json(s: &Settings) -> String {
@@ -33,12 +58,25 @@ pub fn to_json(s: &Settings) -> String {
 }
 
 /// Write the file, making its folder if needed. Only called after the user
-/// changed something in the window.
+/// changed something in the window. Written to a temporary file first and then
+/// renamed over the old one, so a crash or a reader never sees half a file.
 pub fn save(path: &Path, s: &Settings) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, to_json(s))
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(to_json(s).as_bytes())?;
+        f.sync_all()
+    });
+    let res = written.and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Where the file lives: next to the exe if a settings.json is already there
@@ -120,6 +158,54 @@ mod tests {
         assert_eq!(parse(Some("")), Settings::default());
         assert_eq!(parse(Some("[1, 2]")), Settings::default());
         assert_eq!(parse(Some(r#"{ "exclude": "TV" }"#)), Settings::default());
+        assert_eq!(parse(Some("null")), Settings::default());
+        assert_eq!(parse(Some("\u{feff}")), Settings::default());
+        // Truncated in the middle of a write.
+        assert_eq!(parse(Some(r#"{ "hotkey": "Ctrl+Shift+F9", "exclude": ["T"#)), Settings::default());
+    }
+
+    #[test]
+    fn a_wrong_field_keeps_the_other_one() {
+        let s = parse(Some(r#"{ "hotkey": 5, "exclude": ["TV", 3, null, "", "  ", "Monitor"] }"#));
+        assert_eq!(s, Settings { hotkey: DEFAULT_HOTKEY.into(), exclude: vec!["TV".into(), "Monitor".into()] });
+        let s = parse(Some(r#"{ "hotkey": "Alt+F1", "exclude": {"a": 1} }"#));
+        assert_eq!(s, Settings { hotkey: "Alt+F1".into(), exclude: vec![] });
+    }
+
+    /// The files 0.1.0 to 0.4.0 wrote (and the README example) load unchanged.
+    #[test]
+    fn old_versions_load() {
+        let old = "{\n  \"hotkey\": \"Ctrl+Alt+A\",\n  \"exclude\": [\"LG TV\", \"Realtek Digital Output\"]\n}\n";
+        let s = parse(Some(old));
+        assert_eq!(s.hotkey, "Ctrl+Alt+A");
+        assert_eq!(s.exclude, vec!["LG TV", "Realtek Digital Output"]);
+        assert_eq!(parse(Some(&to_json(&s))), s);
+        assert_eq!(parse(Some("{}")), Settings::default());
+    }
+
+    /// Random bytes and cut-off files never panic.
+    #[test]
+    fn garbage_never_panics() {
+        let good = to_json(&Settings { hotkey: "Ctrl+Shift+F9".into(), exclude: vec!["Lautsprecher Ä".into()] });
+        for end in 0..=good.len() {
+            if good.is_char_boundary(end) {
+                let _ = parse(Some(&good[..end]));
+            }
+        }
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let alphabet = b"{}[]\":,. \n\\tu0123456789abcdefnrlsxeTFhotkyclud+-";
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            for _ in 0..(seed % 40) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                text.push(alphabet[(seed % alphabet.len() as u64) as usize] as char);
+            }
+            let s = parse(Some(&text));
+            assert!(!s.hotkey.is_empty() || text.contains("\"\""));
+            seed = seed.wrapping_add(1);
+        }
     }
 
     #[test]
@@ -147,6 +233,15 @@ mod tests {
         let s = Settings { hotkey: "Ctrl+Shift+F9".into(), exclude: vec!["TV".into()] };
         save(&path, &s).unwrap();
         assert_eq!(parse(std::fs::read_to_string(&path).ok().as_deref()), s);
+        // Saving again replaces the file and leaves no temporary file behind.
+        let s2 = Settings { hotkey: "Alt+F1".into(), exclude: vec![] };
+        save(&path, &s2).unwrap();
+        assert_eq!(parse(read(Some(&path)).unwrap().as_deref()), s2);
+        let names: Vec<_> =
+            std::fs::read_dir(path.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(FILE_NAME)]);
+        assert_eq!(read(Some(&dir.join("missing.json"))).unwrap(), None);
+        assert_eq!(read(None).unwrap(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

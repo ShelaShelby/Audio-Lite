@@ -31,6 +31,18 @@ pub fn combo(mods: Mods, key: &str) -> Result<String, &'static str> {
     }
 }
 
+/// Why Ctrl+C, Ctrl+X and Ctrl+V cannot be the hotkey.
+pub const CLIPBOARD: &str = "Ctrl+C, Ctrl+X and Ctrl+V stay for copy and paste.";
+
+/// `combo` for the key as the layout names it, or else for the key at the same
+/// place (`physical`): Shift+1 is "!" on many layouts, Ctrl+Alt+E may be "€".
+pub fn combo_of(mods: Mods, key: &str, physical: Option<&str>) -> Result<String, &'static str> {
+    combo(mods, key).or_else(|e| match physical {
+        Some(p) if p != key => combo(mods, p).map_err(|_| e),
+        _ => Err(e),
+    })
+}
+
 /// "Ctrl + Alt + A" for showing in the window.
 pub fn pretty(text: &str) -> String {
     text.split('+').map(str::trim).collect::<Vec<_>>().join(" + ")
@@ -62,6 +74,44 @@ mod tests {
     fn unusable_keys_are_refused() {
         for key in ["Space", "Enter", "Escape", "F25", "", "Up", "Minus"] {
             assert!(combo(CTRL_ALT, key).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn layout_symbols_fall_back_to_the_key_position() {
+        let shift = Mods { shift: true, ..Mods::default() };
+        assert_eq!(combo_of(shift, "!", Some("1")), Ok("Shift+1".to_string()));
+        assert_eq!(combo_of(CTRL_ALT, "€", Some("E")), Ok("Ctrl+Alt+E".to_string()));
+        assert_eq!(combo_of(CTRL_ALT, "Q", Some("A")), Ok("Ctrl+Alt+Q".to_string()), "the layout wins");
+        assert!(combo_of(CTRL_ALT, "Space", Some("Space")).is_err());
+        assert!(combo_of(CTRL_ALT, "Space", None).is_err());
+        assert!(combo_of(Mods::default(), "!", Some("1")).is_err());
+    }
+
+    /// Every key name egui can give, with every set of modifiers: never a panic,
+    /// and what is accepted always registers as the same keys.
+    #[test]
+    fn every_key_and_modifier() {
+        let mut names: Vec<String> = ('A'..='Z').chain('0'..='9').map(String::from).collect();
+        names.extend((0..=40).map(|n| format!("F{n}")));
+        names.extend(
+            ["Escape", "Tab", "Num1", "€", "ä", "", " ", "+", "Ctrl", "Alt", "Shift", "Win", "F", "F01", "FF"]
+                .map(String::from),
+        );
+        for bits in 0..8 {
+            let m = Mods { ctrl: bits & 1 != 0, alt: bits & 2 != 0, shift: bits & 4 != 0 };
+            for n in &names {
+                if let Ok(text) = combo(m, n) {
+                    let (mods, vk) = settings::parse_hotkey(&text).unwrap();
+                    assert_ne!(mods, 0);
+                    assert_eq!(mods & settings::MOD_CONTROL != 0, m.ctrl);
+                    assert_eq!(mods & settings::MOD_ALT != 0, m.alt);
+                    assert_eq!(mods & settings::MOD_SHIFT != 0, m.shift);
+                    assert!((0x41..=0x5A).contains(&vk) || (0x30..=0x39).contains(&vk) || (0x70..=0x87).contains(&vk));
+                } else {
+                    assert!(bits == 0 || !(n.len() == 1 && n.chars().all(|c| c.is_ascii_alphanumeric())), "{n}");
+                }
+            }
         }
     }
 
