@@ -29,6 +29,9 @@ pub const WINDOW_OPEN: u32 = WM_APP + 20;
 /// To the window process (posted): the pointer is over the tray icon, so a
 /// warm (or hidden) process stays at least `lifetime::WARM` longer.
 pub const WINDOW_WARM: u32 = WM_APP + 21;
+/// To the window process, internal (posted to itself): a warm window's first
+/// frame is done; tell the tray.
+pub const WINDOW_READY: u32 = WM_APP + 22;
 /// In wParam of `WINDOW_OPEN`: lParam holds a point.
 pub const HAS_POINT: usize = 0x10;
 
