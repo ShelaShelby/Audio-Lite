@@ -675,6 +675,12 @@ impl eframe::App for AudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Hidden after its first frame (a warm window waiting for a click, or
+        // a closed one): eframe still runs a pass now and then, but there is
+        // nothing to draw, and a click must not wait for a full frame.
+        if READY.load(Ordering::Relaxed) && !window_visible() {
+            return;
+        }
         let model = engine().model();
         let ppp = ui.ctx().pixels_per_point();
         let wa = work_area();
