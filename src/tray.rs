@@ -123,6 +123,8 @@ struct Tray {
     hovering: bool,
     /// When the last click asked for the window (for the timing in the cycle test).
     show_asked: Option<Instant>,
+    /// How long the last show request to a ready window process took to answer, in ms.
+    show_rtt: Option<u32>,
 }
 
 thread_local! {
@@ -449,9 +451,13 @@ fn open_window(ask: Ask, at: Option<(i32, i32)>) {
                 LRESULT(0)
             };
             if sent.0 != 0 && answer != 0 {
-                if answer as isize != proto::OPEN_SHOWN {
-                    with_tray(|t| t.show_asked = None);
-                }
+                with_tray(|t| {
+                    if answer as isize == proto::OPEN_SHOWN {
+                        t.show_rtt = t.show_asked.map(|a| millis(a.elapsed()));
+                    } else {
+                        t.show_asked = None;
+                    }
+                });
                 return;
             }
             // Ready, but no answer in 3 s: it is stuck, and every later click would
@@ -590,13 +596,23 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         ),
         proto::TRAY_QUIT => quit(wp.0 as i32),
         proto::TRAY_SHOWN => {
-            let asked = if wp.0 == 1 { with_tray(|t| t.show_asked.take()).flatten() } else { None };
+            let asked = if wp.0 == 1 { with_tray(|t| (t.show_asked.take(), t.show_rtt.take())) } else { None };
             test_event(|l| {
                 if wp.0 == 1 {
                     l.shown += 1;
-                    l.show_ms = asked.map(|t| millis(t.elapsed()));
                     let p = lp.0 as u64;
                     l.steps = (p != 0).then(|| [0, 16, 32, 48].map(|b| ((p >> b) & 0xffff) as u32));
+                    let (asked, rtt) = asked.unwrap_or((None, None));
+                    l.heard_ms = asked.map(|t| millis(t.elapsed()));
+                    // When it was on screen, not when the tray got to read the message: the
+                    // window process got the request at most `rtt - show_window` after it was
+                    // sent, and was on screen `uncloaked` ms after it got it.
+                    l.show_ms = match (rtt, l.steps) {
+                        (Some(rtt), Some([done, _, _, on])) if done != 0xffff && on != 0xffff => {
+                            Some(rtt.saturating_sub(done) + on)
+                        }
+                        _ => l.heard_ms,
+                    };
                 } else {
                     l.hidden += 1;
                 }
@@ -803,6 +819,7 @@ pub fn run(cycle_test: Option<u32>, stress_test: Option<u32>) {
         hover_rect: None,
         hovering: false,
         show_asked: None,
+        show_rtt: None,
     };
     TRAY.with(|t| *t.borrow_mut() = Some(tray));
     if !no_hotkey {
@@ -874,6 +891,8 @@ struct TestLog {
     frame_ms: Option<u32>,
     /// The last show: ms from the click to the window on screen.
     show_ms: Option<u32>,
+    /// The last show: ms from the click until the tray read "shown".
+    heard_ms: Option<u32>,
     /// The last show inside the window process, ms after it was asked:
     /// show_window done, next pass, frame drawn, on screen (0xffff: not seen).
     steps: Option<[u32; 4]>,
@@ -887,6 +906,7 @@ static TEST: Mutex<TestLog> = Mutex::new(TestLog {
     ready: 0,
     frame_ms: None,
     show_ms: None,
+    heard_ms: None,
     steps: None,
 });
 
@@ -1022,6 +1042,7 @@ fn start_cycle_test(n: u32) {
         let mut reused = 0;
         let (mut cold_frame, mut cold_show, mut warm_frame, mut warm_show) = (vec![], vec![], vec![], vec![]);
         let mut warm_steps: [Vec<u32>; 4] = Default::default();
+        let mut warm_heard = vec![];
         for c in 1..=n {
             let warm = c.is_multiple_of(2);
             let before = test_log();
@@ -1049,6 +1070,7 @@ fn start_cycle_test(n: u32) {
                 Some(l) if l.shown > before_click.shown => {
                     if warm {
                         warm_show.extend(l.show_ms);
+                        warm_heard.extend(l.heard_ms);
                         for (v, x) in warm_steps.iter_mut().zip(l.steps.unwrap_or([0xffff; 4])) {
                             v.push(x);
                         }
@@ -1128,6 +1150,7 @@ fn start_cycle_test(n: u32) {
         report_times("cold start: click to window on screen", &cold_show);
         report_times("warm: start window process to first painted frame (hidden)", &warm_frame);
         report_times("warm: show request to window on screen", &warm_show);
+        report_times("warm: show request until the tray read \"shown\"", &warm_heard);
         for (what, v) in ["show_window done", "next frame started", "frame drawn", "uncloaked"].iter().zip(&warm_steps)
         {
             report_times(&format!("warm, inside the window process: {what}"), v);
