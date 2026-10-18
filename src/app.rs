@@ -78,6 +78,31 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// Just shown: wait for one painted frame, then uncloak.
 static AWAIT_FRAME: AtomicBool = AtomicBool::new(false);
 static UNCLOAK_NOW: AtomicBool = AtomicBool::new(false);
+/// The steps of the last show, for the timing of the cycle test: asked,
+/// show_window done, next pass started, frame drawn.
+static SHOW_STEPS: Mutex<[Option<Instant>; 4]> = Mutex::new([None; 4]);
+
+fn show_step(i: usize) {
+    let mut s = SHOW_STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    if i == 0 || (s[0].is_some() && s.get(i).is_some_and(Option::is_none)) {
+        if i == 0 {
+            *s = [None; 4];
+        }
+        if let Some(x) = s.get_mut(i) {
+            *x = Some(Instant::now());
+        }
+    }
+}
+
+/// The steps of the last show in ms since it was asked, 16 bits each, the
+/// time it is on screen last (lParam of `TRAY_SHOWN`).
+fn show_steps_packed() -> isize {
+    let s = *SHOW_STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(t0) = s[0] else { return 0 };
+    let ms = |t: Option<Instant>| t.map_or(0xffff, |t| t.saturating_duration_since(t0).as_millis().min(0xfffe) as u64);
+    let now = Some(Instant::now());
+    (ms(s[1]) | ms(s[2]) << 16 | ms(s[3]) << 32 | ms(now) << 48) as isize
+}
 /// The tray icon could not be made: the window stays open and its close button quits.
 static NO_TRAY: AtomicBool = AtomicBool::new(false);
 
@@ -290,6 +315,7 @@ fn load_prefs(p: &mut Prefs) {
 }
 
 fn show_window() {
+    show_step(0);
     with_life(|l| l.shown());
     if !READY.load(Ordering::Relaxed) {
         // The first frame is not painted yet: it opens as soon as it is.
@@ -323,6 +349,7 @@ fn show_window() {
         c.send_viewport_cmd(egui::ViewportCommand::Focus);
         c.request_repaint();
     }
+    show_step(1);
 }
 
 /// Hide the window (`click_away`: it lost the focus). From now on nothing runs
@@ -565,6 +592,9 @@ impl AudioApp {
 
 impl eframe::App for AudioApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if AWAIT_FRAME.load(Ordering::Relaxed) {
+            show_step(2);
+        }
         // The close button only hides the window; Quit is in the window.
         if ctx.input(|i| i.viewport().close_requested()) {
             if NO_TRAY.load(Ordering::Relaxed) {
@@ -593,7 +623,7 @@ impl eframe::App for AudioApp {
         if UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
             schedule_uncloak(None);
             cloak(false);
-            tray_post(proto::TRAY_SHOWN, 1, 0);
+            tray_post(proto::TRAY_SHOWN, 1, show_steps_packed());
         }
 
         if JUST_OPENED.swap(false, Ordering::Relaxed) {
@@ -671,6 +701,9 @@ impl eframe::App for AudioApp {
         // Flags for the next logic() call, which runs after this frame is painted.
         let first = !FIRST_FRAME.swap(true, Ordering::Relaxed);
         let shown = AWAIT_FRAME.swap(false, Ordering::Relaxed);
+        if shown {
+            show_step(3);
+        }
         if shown {
             UNCLOAK_NOW.store(true, Ordering::Relaxed);
         }
