@@ -10,7 +10,6 @@
 
 use crate::audio::{self, Handle};
 use crate::coalesce::{self, Coalescer};
-use crate::cycle::Device;
 use crate::mixer::{self, Row};
 use crate::volume;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,86 +30,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
-/// What a slider controls.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Target {
-    /// The default device's master volume.
-    Master,
-    /// One app row, by its key (see `mixer::Row::key`).
-    App(String),
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct AppLevel {
-    pub key: String,
-    pub name: String,
-    /// 0.0-1.0
-    pub volume: f32,
-    pub muted: bool,
-}
-
-/// What the window shows. Written by the audio thread, and by the window for
-/// its own volume and mute changes, so the window shows them before they are applied.
-#[derive(Clone, Debug, Default)]
-pub struct Model {
-    pub devices: Vec<Device>,
-    pub default_id: Option<String>,
-    pub default_name: String,
-    /// Master volume (0.0-1.0) and mute of the default device.
-    pub master: Option<(f32, bool)>,
-    pub apps: Vec<AppLevel>,
-    /// No device, or Windows audio not available.
-    pub error: Option<String>,
-    pub apps_error: Option<String>,
-    /// The last switching problem, until the next switch works.
-    pub note: Option<String>,
-}
-
-impl Model {
-    fn level(&self, t: &Target) -> Option<f32> {
-        match t {
-            Target::Master => self.master.map(|m| m.0),
-            Target::App(k) => self.apps.iter().find(|a| &a.key == k).map(|a| a.volume),
-        }
-    }
-
-    fn muted(&self, t: &Target) -> Option<bool> {
-        match t {
-            Target::Master => self.master.map(|m| m.1),
-            Target::App(k) => self.apps.iter().find(|a| &a.key == k).map(|a| a.muted),
-        }
-    }
-
-    fn set_level(&mut self, t: &Target, v: f32) {
-        match t {
-            Target::Master => {
-                if let Some(m) = &mut self.master {
-                    m.0 = v;
-                }
-            }
-            Target::App(k) => {
-                if let Some(a) = self.apps.iter_mut().find(|a| &a.key == k) {
-                    a.volume = v;
-                }
-            }
-        }
-    }
-
-    fn set_muted(&mut self, t: &Target, on: bool) {
-        match t {
-            Target::Master => {
-                if let Some(m) = &mut self.master {
-                    m.1 = on;
-                }
-            }
-            Target::App(k) => {
-                if let Some(a) = self.apps.iter_mut().find(|a| &a.key == k) {
-                    a.muted = on;
-                }
-            }
-        }
-    }
-}
+pub use crate::model::{AppLevel, Model, Target};
 
 enum Cmd {
     Refresh,
@@ -140,20 +60,44 @@ struct Inbox {
     held: Option<Target>,
 }
 
+/// Volumes and mutes the user set before what they control was read (the
+/// window shows cache.json until then). They are written as soon as it is.
+#[derive(Default)]
+struct Late {
+    volumes: Vec<(Target, f32)>,
+    mutes: Vec<(Target, bool)>,
+}
+
+impl Late {
+    fn volume(&mut self, t: Target, v: f32) {
+        self.volumes.retain(|(x, _)| *x != t);
+        self.volumes.push((t, v));
+    }
+
+    fn mute(&mut self, t: Target, on: bool) {
+        self.mutes.retain(|(x, _)| *x != t);
+        self.mutes.push((t, on));
+    }
+}
+
 impl Inbox {
     /// The user owns these values right now (a slider being dragged, a volume or
     /// mute not written yet): keep the window's values from `old` for them.
-    fn keep_user_values(&self, old: &Model, new: &mut Model) {
-        for t in self.volumes.pending().iter().map(|(t, _)| t).chain(&self.held) {
+    fn keep_user_values(&self, late: &Late, old: &Model, new: &mut Model) {
+        let volumes =
+            self.volumes.pending().iter().map(|(t, _)| t).chain(&self.held).chain(late.volumes.iter().map(|(t, _)| t));
+        for t in volumes {
             if let Some(v) = old.level(t) {
                 new.set_level(t, v);
             }
         }
-        for c in &self.cmds {
-            if let Cmd::Mute(t, _) = c {
-                if let Some(on) = old.muted(t) {
-                    new.set_muted(t, on);
-                }
+        let mutes = self.cmds.iter().filter_map(|c| match c {
+            Cmd::Mute(t, _) => Some(t),
+            _ => None,
+        });
+        for t in mutes.chain(late.mutes.iter().map(|(t, _)| t)) {
+            if let Some(on) = old.muted(t) {
+                new.set_muted(t, on);
             }
         }
     }
@@ -177,10 +121,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Engine {
-    /// Start the audio thread. It reads everything once right away.
-    pub fn start(changed: fn(), redraw: fn()) -> Arc<Engine> {
+    /// Start the audio thread. It reads everything once right away; until then
+    /// the window shows `first` (the last state, from cache.json).
+    pub fn start(changed: fn(), redraw: fn(), first: Model) -> Arc<Engine> {
         let engine = Arc::new(Engine {
-            model: Mutex::new(Model::default()),
+            model: Mutex::new(first),
             inbox: Mutex::new(Inbox { volumes: Coalescer::new(coalesce::GAP), cmds: vec![Cmd::Refresh], held: None }),
             wake: Condvar::new(),
             changed,
@@ -405,43 +350,79 @@ struct Audio {
     apps_watched: Vec<IAudioSessionControl>,
     /// A refresh asked for while a slider was dragged; it runs when it is let go.
     deferred: bool,
+    late: Late,
 }
 
 impl Audio {
-    fn write_volume(&mut self, t: &Target, v: f32) {
+    /// False if there is nothing to write to (yet).
+    fn write_volume(&mut self, t: &Target, v: f32) -> bool {
         match t {
-            Target::Master => {
-                if let Some(m) = &self.master {
+            Target::Master => match &self.master {
+                Some(m) => {
                     audio::set_endpoint_volume(m, v);
+                    true
                 }
-            }
-            Target::App(k) => {
-                if let Some(r) = self.rows.iter_mut().find(|r| &r.key == k) {
+                None => false,
+            },
+            Target::App(k) => match self.rows.iter_mut().find(|r| &r.key == k) {
+                Some(r) => {
                     for h in &r.handles {
                         audio::set_session_volume(&h.volume, v);
                     }
                     r.volume = v;
+                    true
                 }
-            }
+                None => false,
+            },
         }
     }
 
-    fn write_mute(&mut self, t: &Target, on: bool) {
+    /// False if there is nothing to write to (yet).
+    fn write_mute(&mut self, t: &Target, on: bool) -> bool {
         match t {
-            Target::Master => {
-                if let Some(m) = &self.master {
+            Target::Master => match &self.master {
+                Some(m) => {
                     audio::set_endpoint_mute(m, on);
+                    true
                 }
-            }
-            Target::App(k) => {
-                if let Some(r) = self.rows.iter_mut().find(|r| &r.key == k) {
+                None => false,
+            },
+            Target::App(k) => match self.rows.iter_mut().find(|r| &r.key == k) {
+                Some(r) => {
                     for h in &r.handles {
                         audio::set_session_mute(&h.volume, on);
                     }
                     r.muted = on;
+                    true
                 }
+                None => false,
+            },
+        }
+    }
+
+    /// Write what the user set before it could be written. `last`: after a
+    /// full read; what is still missing then is gone (an app that quit).
+    fn flush_late(&mut self, last: bool) {
+        for (t, v) in std::mem::take(&mut self.late.volumes) {
+            if !self.write_volume(&t, v) && !last {
+                self.late.volume(t, v);
             }
         }
+        for (t, on) in std::mem::take(&mut self.late.mutes) {
+            if !self.write_mute(&t, on) && !last {
+                self.late.mute(t, on);
+            }
+        }
+    }
+
+    /// The window's model becomes `m`, keeping what the user owns right now.
+    /// `note`: Some(..) replaces the switching note, None keeps the one shown.
+    fn store(&self, mut m: Model, note: Option<Option<String>>) {
+        let inbox = lock(&self.engine.inbox);
+        let mut model = lock(&self.engine.model);
+        inbox.keep_user_values(&self.late, &model, &mut m);
+        m.note = note.unwrap_or_else(|| model.note.take());
+        *model = m;
     }
 
     fn watch_apps(&mut self) {
@@ -502,8 +483,9 @@ impl Audio {
             .collect()
     }
 
-    /// Read everything again: devices, the default one, its volume and its apps.
-    /// The change events are registered again on what was read.
+    /// Read everything again: devices, the default one and its volume first
+    /// (the window shows them at once), then its apps. The change events are
+    /// registered again on what was read.
     fn refresh(&mut self, note: Option<Option<String>>) {
         self.unwatch();
         let mut m = Model::default();
@@ -512,6 +494,7 @@ impl Audio {
         self.manager = None;
         self.new_sessions.clear();
         let old_rows = std::mem::take(&mut self.rows);
+        let mut device = None;
         match &self.enumerator {
             None => m.error = Some("Windows audio is not available".into()),
             Some(e) => {
@@ -520,27 +503,17 @@ impl Audio {
                     Err(err) => m.error = Some(format!("Could not list devices: {}", err.message())),
                 }
                 match audio::default_endpoint(e) {
-                    Ok((device, control)) => {
-                        let def = audio::default_device(e);
-                        m.default_id = def.as_ref().map(|d| d.id.clone());
-                        m.default_name = audio::device_display_name(&device);
+                    Ok((d, control)) => {
+                        let info = audio::device_info(&d);
+                        m.default_name =
+                            info.as_ref().map_or_else(|| audio::device_display_name(&d), |i| i.name.clone());
+                        m.default_id = info.map(|i| i.id);
                         match audio::endpoint_state(&control) {
                             Ok(state) => m.master = Some(state),
                             Err(err) => m.error = Some(format!("Could not read the volume: {}", err.message())),
                         }
-                        // The session list is read before the manager is watched,
-                        // otherwise Windows does not report new sessions.
-                        let list = audio::session_manager(&device)
-                            .and_then(|mgr| Ok((audio::sessions(&mgr, &mut self.names)?, mgr)));
-                        match list {
-                            Ok((list, mgr)) => {
-                                self.rows = mixer::merge(list);
-                                self.manager = Some(mgr);
-                            }
-                            Err(err) => m.apps_error = Some(format!("Could not read apps: {}", err.message())),
-                        }
-                        self.device = Some(device);
                         self.master = Some(control);
+                        device = Some(d);
                     }
                     Err(_) => {
                         m.default_name = "No playback device".into();
@@ -548,6 +521,29 @@ impl Audio {
                     }
                 }
             }
+        }
+        let mut note = note;
+        if let Some(d) = device {
+            // Shown at once; the apps of the same device stay as they were until read.
+            let mut first = m.clone();
+            let same = lock(&self.engine.model).default_id == first.default_id;
+            if same {
+                first.apps = lock(&self.engine.model).apps.clone();
+            }
+            self.store(first, note.take());
+            self.flush_late(false);
+            (self.engine.changed)();
+            // The session list is read before the manager is watched,
+            // otherwise Windows does not report new sessions.
+            let list = audio::session_manager(&d).and_then(|mgr| Ok((audio::sessions(&mgr, &mut self.names)?, mgr)));
+            match list {
+                Ok((list, mgr)) => {
+                    self.rows = mixer::merge(list);
+                    self.manager = Some(mgr);
+                }
+                Err(err) => m.apps_error = Some(format!("Could not read apps: {}", err.message())),
+            }
+            self.device = Some(d);
         }
         // Other apps now: forget the names of processes that are gone.
         if mixer::rows_changed(&old_rows, &self.rows) {
@@ -558,11 +554,8 @@ impl Audio {
             self.watch();
         }
         m.apps = self.app_levels();
-        let inbox = lock(&self.engine.inbox);
-        let mut model = lock(&self.engine.model);
-        inbox.keep_user_values(&model, &mut m);
-        m.note = note.unwrap_or_else(|| model.note.take());
-        *model = m;
+        self.store(m, note);
+        self.flush_late(true);
     }
 
     /// The list of apps again, without the devices. True if the window has to be redrawn.
@@ -587,7 +580,9 @@ impl Audio {
         drop(old_rows);
         self.watch_apps();
         let apps = self.app_levels();
-        self.publish(|m| m.apps = apps)
+        let changed = self.publish(|m| m.apps = apps);
+        self.flush_late(false);
+        changed
     }
 
     /// Volumes and mutes only: no devices, no names. True if one of them changed.
@@ -624,7 +619,7 @@ impl Audio {
         let mut model = lock(&self.engine.model);
         let mut m = model.clone();
         f(&mut m);
-        inbox.keep_user_values(&model, &mut m);
+        inbox.keep_user_values(&self.late, &model, &mut m);
         let changed = m.master != model.master || m.apps != model.apps;
         *model = m;
         changed
@@ -667,6 +662,7 @@ fn run(engine: Arc<Engine>) {
         sessions_watched: false,
         apps_watched: Vec::new(),
         deferred: false,
+        late: Late::default(),
     };
     loop {
         let (cmds, volumes, held) = {
@@ -686,8 +682,11 @@ fn run(engine: Arc<Engine>) {
             (std::mem::take(&mut inbox.cmds), inbox.volumes.take(Instant::now()), inbox.held.is_some())
         };
         // No lock is held while Windows audio is called.
-        for (t, v) in &volumes {
-            a.write_volume(t, *v);
+        for (t, v) in volumes {
+            // Not read yet (the window shows cache.json): written once it is.
+            if !a.write_volume(&t, v) {
+                a.late.volume(t, v);
+            }
         }
         let mut refresh = std::mem::take(&mut a.deferred);
         let mut values = false;
@@ -702,7 +701,11 @@ fn run(engine: Arc<Engine>) {
                     a.new_sessions.extend(new.map(|n| n.0));
                     apps = true;
                 }
-                Cmd::Mute(t, on) => a.write_mute(&t, on),
+                Cmd::Mute(t, on) => {
+                    if !a.write_mute(&t, on) {
+                        a.late.mute(t, on);
+                    }
+                }
                 Cmd::Unwatch => {
                     // Asked again since: the newest wish wins.
                     if !engine.live.load(Ordering::Relaxed) {

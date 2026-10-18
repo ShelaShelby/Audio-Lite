@@ -29,13 +29,20 @@ jobs:
           size=$(wc -c < target/release/audio-lite.exe)
           echo "audio-lite.exe: $size bytes"
           echo "### Binary size: $size bytes" >> "$GITHUB_STEP_SUMMARY"
-      # Memory check: from the tray process, start the window process, show and
-      # hide it, let it exit, 100 times. Prints the tray's PrivateUsage and
-      # WorkingSetSize at the start (idle), 25, 50 and 100 cycles and 3 s later.
-      # The app itself fails the test (no "cycle-test: PASS") if the tray grew by
-      # more than 1 MB or a window process is left over; it also fails if the
-      # test does not finish.
-      - name: Cycle test (window process start/show/hide/exit x100, memory)
+      # Memory and timing check: from the tray process, start the window
+      # process, show and hide it, let it exit, 100 times: 50 cold starts (the
+      # click starts it) and 50 warm ones (started as the pointer over the
+      # icon would, painted hidden, then clicked); then 3 warm ones without a
+      # click must exit by themselves. Prints the tray's PrivateUsage and
+      # WorkingSetSize at the start (idle), 25, 50 and 100 cycles and 3 s later,
+      # and the median and largest time from "start window process" to its
+      # first painted frame and from the click to the window on screen, for
+      # cold and warm starts. The app itself fails the test (no
+      # "cycle-test: PASS") if the tray grew by more than 1 MB, a window
+      # process is left over, or a warm window takes more than 150 ms (median)
+      # to show; the runner has no GPU, so the cold numbers are for
+      # information only. It also fails if the test does not finish.
+      - name: Cycle test (cold and warm start/show/hide/exit x100, memory, timing)
         timeout-minutes: 20
         shell: bash
         run: |
@@ -52,13 +59,16 @@ jobs:
             touch cycle-test.log && cat cycle-test.log && summary "Mesa llvmpipe (software OpenGL)" cycle-test.log
           fi
           grep -q "+3 s idle" cycle-test.log || { echo "cycle test did not finish"; exit 1; }
+          { echo "### Timing"; echo '```'; grep "ms (" cycle-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
           grep -q "cycle-test: PASS" cycle-test.log || { echo "cycle test failed"; exit 1; }
-      # Stress test: 200 times, click the tray icon (sometimes 2 or 3 times in a
-      # row), wait a random time (the window process is starting, painting,
-      # shown, hidden or exiting), sometimes hide it, then kill the window
-      # process. Fails if the tray dies, a window process is left over, or the
-      # tray holds more than 10 handles more than after round 5.
-      - name: Stress test (kill the window process at random times x200, handles)
+      # Stress test: 200 times, click the tray icon or move the pointer over it
+      # (1 to 3 times in a row: cold and warm starts, clicks while a warm
+      # process gets ready, clicks on a shown or exiting window), wait a random
+      # time (the window process is starting, painting, warm, shown, hidden or
+      # exiting), sometimes hide it, then kill the window process. Fails if the
+      # tray dies, a window process is left over, or the tray holds more than
+      # 10 handles more than after round 5.
+      - name: Stress test (warm and cold starts, kill at random times x200, handles)
         timeout-minutes: 30
         shell: bash
         run: |

@@ -2,6 +2,100 @@
 
 What changed in each version, newest first.
 
+## 0.4.2
+
+The window opens at once, and a second bug hunt.
+
+### Faster
+
+- The window part is started as soon as the pointer moves over the tray
+  icon: it loads, draws itself hidden and starts the audio part, so the
+  click only shows the finished window (about one frame instead of about
+  0.3 s). Without a click it exits 5 s after the pointer left the icon,
+  and while it waits it uses no CPU.
+- The first frame never waits for Windows audio: the window shows the
+  devices and volumes from last time (`cache.json`, next to
+  `settings.json`, written when the window closes) and switches to the
+  current ones as soon as they are read: the default device and its master
+  volume first, the app rows after. A slider you move before that keeps
+  your value. Less is done before the first frame (the tray's hotkey state
+  and "Start with Windows" are read when the window is shown, the tooltip
+  is updated after a click, not before).
+
+### Fixed
+
+- After the pointer rested on the tray icon and then left, the tray part
+  woke up about 66 times a second until the pointer came back over the
+  icon (a timer of the tray icon library that was never stopped). Audio
+  Lite now stops it.
+- Shift + a letter or a digit could be chosen as the hotkey; it then took
+  that character away from typing in every program. Shift alone now only
+  works with F1 to F24 (the window says so), and such a hotkey in
+  settings.json is replaced by the default.
+- Alt + F4 could be chosen as the hotkey and then no longer closed windows.
+- The arrow keys moved a volume slider by less than 1 %, so the number
+  sometimes did not change. Each press is now exactly 1 %.
+- With a taskbar that hides itself, the window opened over the taskbar
+  while it was shown. It now opens above (or beside) it.
+- A window part that stopped answering made every later tray click do
+  nothing until it was ended in Task Manager. The tray now ends it after
+  3 s and opens a new one.
+- In a rare race a tray click could be sent to a window of another program
+  that got the handle of a window part that had just ended.
+- Closing the window in the very moment it opened (before its first frame)
+  could leave a timer that later uncloaked the hidden window and reported
+  it as shown.
+- App names made only of invisible characters (zero-width spaces and the
+  like) showed an empty row, and line breaks or tabs in a name showed in
+  the row. Such names now fall back to the program name.
+- Apps in a folder with a path longer than 1024 characters showed as
+  "Process 1234" and were not grouped with other windows of the same app.
+- A huge settings.json (over 1 MB) was read whole into memory. It is now
+  taken as broken (the defaults are used).
+- On very large or odd monitor layouts the window's largest height could
+  be computed wrong.
+- Recording Shift + a digit on a layout that gives a symbol ("!") showed
+  "Use a letter, a digit or F1 to F24" instead of the real reason.
+
+### Changed
+
+- CI: the cycle test now runs 50 cold starts (the click starts the window
+  part) and 50 warm ones (started as the pointer would, then clicked), then
+  3 warm ones that must exit by themselves without a click. It prints the
+  median and largest time from starting the window part to its first
+  painted frame and from the click to the window on screen, and fails if a
+  warm window takes more than 150 ms (median) to show. The stress test
+  mixes warm and cold starts and clicks while a warm window part is
+  getting ready.
+- More tests: the cache file (broken, cut off, odd values, random bytes),
+  the warm lifetime, the taskbar placement, hotkeys with Shift or Alt + F4,
+  arrow key steps, app names with invisible characters.
+
+### Known issues
+
+- The window part is started early only when the pointer moves over the
+  tray icon. Opening it with the keyboard (Win + B, then Enter) or by touch
+  still takes the normal start time.
+- Moving the pointer across the tray icon without clicking starts the
+  window part for about 5 s (a short burst of work, then nothing).
+- For a moment after opening, the window can show the devices and volumes
+  from last time, until Windows has answered (usually well under 0.1 s).
+- A digit on the number pad is recorded as the same digit on the top row
+  (egui does not tell them apart), so the hotkey then needs the top-row key.
+- Two devices with exactly the same name share one "In hotkey cycle"
+  checkbox, because settings.json keeps device names.
+- Ctrl + V is only reported as "stays for paste" when the clipboard has
+  something in it; otherwise nothing happens.
+- If the tray part does not answer within 2 s while a new hotkey is saved,
+  the window keeps the old one in settings.json even if the tray took the
+  new one. Changing the hotkey again or restarting Audio Lite fixes it.
+- A playback device without a volume control is reported as "No audio
+  output device found".
+- Explorer restarts, DPI and monitor changes, sleep, remote desktop, the
+  pointer over the tray icon and real sound are not covered by the
+  automatic tests (the build machine has no screen session of its own and
+  no sound card); the CI timing uses software OpenGL.
+
 ## 0.4.1
 
 A bug hunt: no new features, the look is the same.

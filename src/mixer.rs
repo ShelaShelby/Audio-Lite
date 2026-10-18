@@ -59,8 +59,17 @@ fn exe_stem(path: &str) -> Option<String> {
     (!stem.is_empty()).then(|| stem.to_string())
 }
 
+/// Zero-width spaces, joiners, direction marks and the like: nothing to see.
+fn invisible(c: char) -> bool {
+    matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
+
+/// A name without control characters (line breaks, tabs), trimmed; None if
+/// nothing visible is left.
 fn clean(s: &Option<String>) -> Option<String> {
-    s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    let s: String = s.as_deref()?.chars().filter(|c| !c.is_control()).collect();
+    let s = s.trim();
+    s.chars().any(|c| !c.is_whitespace() && !invisible(c)).then(|| s.to_string())
 }
 
 /// The name shown for a session: "System sounds", the exe's description, the
@@ -203,6 +212,27 @@ mod tests {
         sys.system = true;
         sys.description = Some("ignored".into());
         assert_eq!(name_of(&sys), SYSTEM_SOUNDS);
+    }
+
+    #[test]
+    fn weird_names() {
+        // Only invisible characters: the next name is used.
+        let mut d = s("a", 5, Some("C:\\x\\game.exe"));
+        d.description = Some("\u{200b}\u{feff} \t".into());
+        assert_eq!(name_of(&d), "game");
+        // Line breaks and tabs never reach the window.
+        d.description = Some("Line\none\ttwo\r".into());
+        assert_eq!(name_of(&d), "Lineonetwo");
+        // Right-to-left and emoji names stay as they are.
+        d.description = Some("מוזיקה 🎵".into());
+        assert_eq!(name_of(&d), "מוזיקה 🎵");
+        let mut n = s("b", 6, None);
+        n.display_name = Some("\u{202e}".into());
+        assert_eq!(name_of(&n), "Process 6");
+        // An exe with no name before ".exe", or a path ending in a slash.
+        assert_eq!(name_of(&s("c", 7, Some("C:\\x\\.exe"))), "Process 7");
+        assert_eq!(name_of(&s("c", 8, Some("C:\\x\\"))), "Process 8");
+        assert_eq!(name_of(&s("c", 9, Some("ä.EXE"))), "ä");
     }
 
     #[test]

@@ -13,6 +13,11 @@ pub fn to_scalar(v: f32) -> Option<f32> {
     (!v.is_nan()).then(|| v.clamp(0.0, 1.0))
 }
 
+/// A slider value (0-100) moved by whole percents from the percent it shows.
+pub fn step(value: f32, steps: i64) -> f32 {
+    (i64::from(to_percent(value / 100.0)).saturating_add(steps)).clamp(0, 100) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +75,23 @@ mod tests {
         assert_eq!(to_scalar(f32::NEG_INFINITY), Some(0.0));
         assert_eq!(to_scalar(0.0), Some(0.0));
         assert_eq!(to_scalar(1.0), Some(1.0));
+    }
+
+    #[test]
+    fn arrow_keys_move_whole_percents() {
+        assert_eq!(step(50.0, 1), 51.0);
+        assert_eq!(step(50.36, 1), 51.0, "from the shown 50");
+        assert_eq!(step(50.6, -1), 50.0, "from the shown 51");
+        assert_eq!(step(0.2, -3), 0.0);
+        assert_eq!(step(99.7, 5), 100.0);
+        assert_eq!(step(f32::NAN, 1), 1.0);
+        assert_eq!(step(30.0, i64::MAX), 100.0);
+        assert_eq!(step(30.0, i64::MIN), 0.0);
+        for p in 0..=100u32 {
+            for d in [-2i64, -1, 1, 2] {
+                let want = (i64::from(p) + d).clamp(0, 100);
+                assert_eq!(to_percent(step(p as f32, d) / 100.0) as i64, want);
+            }
+        }
     }
 }

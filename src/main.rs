@@ -15,6 +15,7 @@ mod hotkey;
 mod icon;
 mod lifetime;
 mod mixer;
+mod model;
 mod place;
 mod proto;
 mod settings;

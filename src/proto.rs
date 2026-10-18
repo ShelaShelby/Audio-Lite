@@ -26,6 +26,9 @@ pub const TRAY_TEST: u32 = WM_APP + 8;
 /// To the window process (sent): wParam = `ask_code` (plus `HAS_POINT`),
 /// lParam = `pack_point` of the tray icon. Answer: `OPEN_*`, or 0 if it is exiting.
 pub const WINDOW_OPEN: u32 = WM_APP + 20;
+/// To the window process (posted): the pointer is over the tray icon, so a
+/// warm (or hidden) process stays at least `lifetime::WARM` longer.
+pub const WINDOW_WARM: u32 = WM_APP + 21;
 /// In wParam of `WINDOW_OPEN`: lParam holds a point.
 pub const HAS_POINT: usize = 0x10;
 
@@ -125,6 +128,8 @@ pub const TEST_HIDE: usize = 2;
 pub const TEST_TOGGLE: usize = 3;
 /// Kill every window process (stress test).
 pub const TEST_KILL: usize = 4;
+/// The pointer moved over the tray icon (starts a warm window process).
+pub const TEST_HOVER: usize = 5;
 
 #[cfg(test)]
 mod tests {

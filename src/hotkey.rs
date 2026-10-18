@@ -25,8 +25,14 @@ pub fn combo(mods: Mods, key: &str) -> Result<String, &'static str> {
         }
     }
     text.push_str(&key.trim().to_ascii_uppercase());
+    if text == "Alt+F4" {
+        return Err("Alt+F4 stays for closing windows.");
+    }
     match settings::parse_hotkey(&text) {
         Some(_) => Ok(text),
+        None if !(mods.ctrl || mods.alt) && settings::parse_hotkey(&format!("Ctrl+{key}")).is_some() => {
+            Err("Shift alone only works with F1 to F24; add Ctrl or Alt.")
+        }
         None => Err("Use a letter, a digit or F1 to F24."),
     }
 }
@@ -38,7 +44,8 @@ pub const CLIPBOARD: &str = "Ctrl+C, Ctrl+X and Ctrl+V stay for copy and paste."
 /// place (`physical`): Shift+1 is "!" on many layouts, Ctrl+Alt+E may be "€".
 pub fn combo_of(mods: Mods, key: &str, physical: Option<&str>) -> Result<String, &'static str> {
     combo(mods, key).or_else(|e| match physical {
-        Some(p) if p != key => combo(mods, p).map_err(|_| e),
+        // The key at that place says best what is wrong with it.
+        Some(p) if p != key => combo(mods, p),
         _ => Err(e),
     })
 }
@@ -79,8 +86,8 @@ mod tests {
 
     #[test]
     fn layout_symbols_fall_back_to_the_key_position() {
-        let shift = Mods { shift: true, ..Mods::default() };
-        assert_eq!(combo_of(shift, "!", Some("1")), Ok("Shift+1".to_string()));
+        let ctrl_shift = Mods { ctrl: true, shift: true, ..Mods::default() };
+        assert_eq!(combo_of(ctrl_shift, "!", Some("1")), Ok("Ctrl+Shift+1".to_string()));
         assert_eq!(combo_of(CTRL_ALT, "€", Some("E")), Ok("Ctrl+Alt+E".to_string()));
         assert_eq!(combo_of(CTRL_ALT, "Q", Some("A")), Ok("Ctrl+Alt+Q".to_string()), "the layout wins");
         assert!(combo_of(CTRL_ALT, "Space", Some("Space")).is_err());
@@ -109,10 +116,32 @@ mod tests {
                     assert_eq!(mods & settings::MOD_SHIFT != 0, m.shift);
                     assert!((0x41..=0x5A).contains(&vk) || (0x30..=0x39).contains(&vk) || (0x70..=0x87).contains(&vk));
                 } else {
-                    assert!(bits == 0 || !(n.len() == 1 && n.chars().all(|c| c.is_ascii_alphanumeric())), "{n}");
+                    let shift_only = bits == 4;
+                    assert!(
+                        bits == 0 || shift_only || !(n.len() == 1 && n.chars().all(|c| c.is_ascii_alphanumeric())),
+                        "{n}"
+                    );
                 }
             }
         }
+    }
+
+    /// Shift alone with a letter or digit would take that character away from typing.
+    #[test]
+    fn shift_alone_needs_an_f_key() {
+        let shift = Mods { shift: true, ..Mods::default() };
+        assert_eq!(combo(shift, "A"), Err("Shift alone only works with F1 to F24; add Ctrl or Alt."));
+        assert_eq!(combo_of(shift, "!", Some("1")), Err("Shift alone only works with F1 to F24; add Ctrl or Alt."));
+        assert_eq!(combo(shift, "F12"), Ok("Shift+F12".to_string()));
+        assert_eq!(combo(shift, "Space"), Err("Use a letter, a digit or F1 to F24."));
+    }
+
+    #[test]
+    fn alt_f4_stays_for_closing_windows() {
+        let alt = Mods { alt: true, ..Mods::default() };
+        assert_eq!(combo(alt, "F4"), Err("Alt+F4 stays for closing windows."));
+        assert_eq!(combo(alt, "f4"), Err("Alt+F4 stays for closing windows."));
+        assert_eq!(combo(CTRL_ALT, "F4"), Ok("Ctrl+Alt+F4".to_string()));
     }
 
     #[test]

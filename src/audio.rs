@@ -158,6 +158,11 @@ pub fn device_display_name(d: &IMMDevice) -> String {
     device_name(d)
 }
 
+/// Id and name of a device.
+pub fn device_info(d: &IMMDevice) -> Option<Device> {
+    Some(Device { id: device_id(d).ok()?, name: device_name(d) })
+}
+
 /// Master volume (0.0-1.0) and mute.
 pub fn endpoint_state(v: &IAudioEndpointVolume) -> windows::core::Result<(f32, bool)> {
     unsafe { Ok((v.GetMasterVolumeLevelScalar()?, v.GetMute()?.as_bool())) }
@@ -199,7 +204,8 @@ fn exe_path(pid: u32) -> Option<String> {
     }
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buf = [0u16; 1024];
+        // Long enough for any path (\\?\ paths go up to 32767 characters).
+        let mut buf = vec![0u16; 32768];
         let mut len = buf.len() as u32;
         let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
         let _ = CloseHandle(h);

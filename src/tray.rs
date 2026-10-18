@@ -8,6 +8,11 @@
 //! most one window process: the tray keeps its process handle, and a window
 //! process that starts while an old one is still exiting waits for it (named
 //! mutex, see `app::run`).
+//!
+//! When the pointer comes over the icon and there is no window process, one
+//! is started "warm" (`--warm`): it gets everything ready and paints hidden,
+//! so the click only has to show it. While the pointer stays on the icon the
+//! tray tells it so every half second; 5 s after the last time it exits.
 
 use crate::args::{self, WindowArgs};
 use crate::lifetime::Ask;
@@ -24,7 +29,7 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 use windows::core::{implement, w, Result as WinResult, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, HANDLE, HWND, LPARAM, LRESULT, POINT, WAIT_FAILED,
     WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Media::Audio::{
@@ -45,10 +50,10 @@ use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CON
 use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT};
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW, KillTimer,
-    MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, RegisterClassW, SendMessageTimeoutW, SetTimer,
-    TranslateMessage, HWND_MESSAGE, MB_OK, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SMTO_ABORTIFHUNG,
-    WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos,
+    GetWindowThreadProcessId, KillTimer, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW, RegisterClassW,
+    SendMessageTimeoutW, SetTimer, TranslateMessage, HWND_MESSAGE, MB_OK, MSG, MWMO_INPUTAVAILABLE, PM_REMOVE,
+    QS_ALLINPUT, SMTO_ABORTIFHUNG, WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 const HOTKEY_ID: i32 = 1;
@@ -63,6 +68,13 @@ const MAX_CHILDREN: usize = 4;
 /// after the last window process exited (pages it needs again come back by themselves).
 const TRIM_TIMER: usize = 2;
 const TRIM_AFTER_MS: u32 = 2000;
+/// While the pointer is over the tray icon: is it still there?
+const HOVER_TIMER: usize = 3;
+const HOVER_EVERY_MS: u32 = 500;
+/// tray-icon's own timer for its Leave event. It keeps firing every 15 ms when
+/// the pointer rested on the icon and then left (tray-icon 0.26 only stops it
+/// when it sees the pointer leave after a move), so the tray stops it itself.
+const TRAY_ICON_LEAVE_TIMER: usize = 6007;
 
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -76,6 +88,11 @@ struct Child {
     pid: u32,
     /// Its message window, once it said it is ready (`TRAY_HELLO`).
     hwnd: Option<isize>,
+    /// Started by the pointer over the icon: it shows itself only when asked.
+    warm: bool,
+    /// A click came while it was still starting: show it (at this point) when it is ready.
+    pending: Option<Option<(i32, i32)>>,
+    started: Instant,
 }
 
 /// Main thread only: the tray icon, the message window and the hotkey all live there.
@@ -100,6 +117,12 @@ struct Tray {
     /// Passed on to the window processes (the cycle test makes them exit sooner).
     linger_ms: Option<u64>,
     testing: bool,
+    /// The tray icon in screen pixels (left, top, right, bottom), from the last pointer event.
+    hover_rect: Option<[i32; 4]>,
+    /// The hover timer runs.
+    hovering: bool,
+    /// When the last click asked for the window (for the timing in the cycle test).
+    show_asked: Option<Instant>,
 }
 
 thread_local! {
@@ -260,7 +283,9 @@ impl Tray {
         self.update_tooltip();
     }
 
-    fn start_window(&mut self, at: Option<(i32, i32)>) {
+    /// Start a window process: `warm` for the pointer over the icon (it stays
+    /// hidden until a click), otherwise for a click (it opens when ready).
+    fn start_window(&mut self, at: Option<(i32, i32)>, warm: bool) {
         if self.children.len() >= MAX_CHILDREN {
             return;
         }
@@ -271,12 +296,14 @@ impl Tray {
             at,
             linger_ms: self.linger_ms,
             no_tray: self.no_tray && !self.testing,
+            warm,
         };
         // The exact path (any character a file name may have), not the text form.
         let exe_w: Vec<u16> = exe_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let mut line = wide(&args::command_line(&exe, &w));
         let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
         let mut pi = PROCESS_INFORMATION::default();
+        let start = Instant::now();
         let started = unsafe {
             CreateProcessW(
                 PCWSTR(exe_w.as_ptr()),
@@ -295,8 +322,17 @@ impl Tray {
             Ok(()) => unsafe {
                 let _ = CloseHandle(pi.hThread);
                 // The click gave the tray the right to bring a window to the front; pass it on.
-                let _ = AllowSetForegroundWindow(pi.dwProcessId);
-                self.children.push(Child { process: pi.hProcess, pid: pi.dwProcessId, hwnd: None });
+                if !warm {
+                    let _ = AllowSetForegroundWindow(pi.dwProcessId);
+                }
+                self.children.push(Child {
+                    process: pi.hProcess,
+                    pid: pi.dwProcessId,
+                    hwnd: None,
+                    warm,
+                    pending: None,
+                    started: start,
+                });
                 if self.testing {
                     TEST_CHILD.store(pi.hProcess.0 as isize, Ordering::Relaxed);
                     test_event(|l| l.started += 1);
@@ -316,6 +352,11 @@ impl Tray {
                 let _ = CloseHandle(c.process);
             }
             test_event(|l| l.exited += 1);
+            // A warm process ended (or failed) before it was ready, and a click
+            // was waiting for it: that click still opens the window.
+            if let Some(at) = c.pending {
+                self.start_window(at, false);
+            }
         }
         if self.children.is_empty() {
             arm_trim();
@@ -332,48 +373,174 @@ impl Tray {
     }
 }
 
+/// The process that owns `hwnd`, so a message never goes to a window of another
+/// program that got the handle of a window process that just ended.
+fn window_pid(hwnd: isize) -> u32 {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid)) };
+    pid
+}
+
+/// What a click finds.
+enum Found {
+    /// No window process: start one.
+    None,
+    /// One is starting (a cold one opens by itself; a warm one now knows the click).
+    Starting,
+    Ready {
+        pid: u32,
+        hwnd: isize,
+        process: HANDLE,
+    },
+}
+
 /// A tray click (or a step of the cycle test): ask the waiting window process,
 /// or start a new one.
 fn open(ask: Ask, at: Option<(i32, i32)>) {
-    // A tooltip Windows did not take (Explorer was restarting) is set again.
+    open_window(ask, at);
+    // A tooltip Windows did not take (Explorer was restarting) is set again;
+    // after the window, so the click does not wait for Windows audio.
     with_tray(Tray::update_tooltip);
-    let current = with_tray(|t| t.children.last().map(|c| (c.pid, c.hwnd, c.process))).flatten();
-    if let Some((pid, hwnd, process)) = current {
-        // Still starting: it shows itself when it is ready.
-        let Some(hwnd) = hwnd else { return };
-        let mut wp = proto::ask_code(ask);
-        let mut lp = 0;
-        if let Some((x, y)) = at {
-            wp |= proto::HAS_POINT;
-            lp = proto::pack_point(x, y);
-        }
-        let mut answer = 0usize;
-        let sent = unsafe {
-            let _ = AllowSetForegroundWindow(pid);
-            SendMessageTimeoutW(
-                HWND(hwnd as *mut _),
-                proto::WINDOW_OPEN,
-                WPARAM(wp),
-                LPARAM(lp),
-                SMTO_ABORTIFHUNG,
-                ASK_TIMEOUT_MS,
-                Some(&mut answer),
-            )
+}
+
+fn open_window(ask: Ask, at: Option<(i32, i32)>) {
+    let found = with_tray(|t| {
+        let show = ask != Ask::Hide;
+        let Some(c) = t.children.last_mut() else { return Found::None };
+        let Some(hwnd) = c.hwnd else {
+            // Still starting. A warm one opens when ready if a click came meanwhile.
+            if c.warm {
+                c.pending = show.then_some(at);
+                t.show_asked = show.then(Instant::now);
+            }
+            return Found::Starting;
         };
-        if sent.0 != 0 && answer != 0 {
-            return;
+        if show {
+            t.show_asked = Some(Instant::now());
         }
-        // Not answering but still there: never start a second window process.
-        let timed_out = sent.0 == 0 && unsafe { GetLastError() } == ERROR_TIMEOUT;
-        if timed_out && unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT {
-            return;
+        Found::Ready { pid: c.pid, hwnd, process: c.process }
+    })
+    .unwrap_or(Found::Starting);
+    match found {
+        Found::Starting => return,
+        Found::None => {}
+        Found::Ready { pid, hwnd, process } => {
+            let mut wp = proto::ask_code(ask);
+            let mut lp = 0;
+            if let Some((x, y)) = at {
+                wp |= proto::HAS_POINT;
+                lp = proto::pack_point(x, y);
+            }
+            let mut answer = 0usize;
+            let sent = if window_pid(hwnd) == pid {
+                unsafe {
+                    let _ = AllowSetForegroundWindow(pid);
+                    SendMessageTimeoutW(
+                        HWND(hwnd as *mut _),
+                        proto::WINDOW_OPEN,
+                        WPARAM(wp),
+                        LPARAM(lp),
+                        SMTO_ABORTIFHUNG,
+                        ASK_TIMEOUT_MS,
+                        Some(&mut answer),
+                    )
+                }
+            } else {
+                LRESULT(0)
+            };
+            if sent.0 != 0 && answer != 0 {
+                if answer as isize != proto::OPEN_SHOWN {
+                    with_tray(|t| t.show_asked = None);
+                }
+                return;
+            }
+            // Ready, but no answer in 3 s: it is stuck, and every later click would
+            // wait for it too. End it; the new one waits until it is gone.
+            let timed_out = sent.0 == 0 && unsafe { GetLastError() } == ERROR_TIMEOUT;
+            if timed_out && unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT {
+                unsafe {
+                    let _ = TerminateProcess(process, 1);
+                }
+            }
+            // It is exiting (it refused, or its message window is gone). The new one
+            // waits until it has exited.
         }
-        // It is exiting (it refused, or its message window is gone). The new one
-        // waits until it has exited.
     }
     if ask != Ask::Hide {
-        with_tray(|t| t.start_window(at));
+        with_tray(|t| {
+            t.show_asked = Some(Instant::now());
+            t.start_window(at, false);
+        });
     }
+}
+
+/// The middle of a rectangle (left, top, right, bottom).
+fn middle(r: [i32; 4]) -> (i32, i32) {
+    ((r[0] / 2).saturating_add(r[2] / 2), (r[1] / 2).saturating_add(r[3] / 2))
+}
+
+/// The pointer is over the tray icon (`rect`; None in the tests): start a warm
+/// window process if there is none, and watch whether the pointer stays.
+fn hover(rect: Option<[i32; 4]>) {
+    with_tray(|t| {
+        // Without a tray icon the window is always open.
+        if t.no_tray && !t.testing {
+            return;
+        }
+        if rect.is_some() {
+            t.hover_rect = rect;
+        }
+        if !t.hovering && !msg_hwnd().0.is_null() {
+            t.hovering = unsafe { SetTimer(msg_hwnd(), HOVER_TIMER, HOVER_EVERY_MS, None) } != 0;
+        }
+        if t.children.is_empty() {
+            t.start_window(rect.map(middle), true);
+        }
+    });
+}
+
+/// Every half second while hovering: still over the icon? Then keep the warm
+/// process (or start one, if the last one ended). Otherwise stop watching.
+fn hover_tick() {
+    let mut p = POINT::default();
+    let cursor = unsafe { GetCursorPos(&mut p) }.is_ok();
+    let target = with_tray(|t| {
+        let inside = cursor && t.hover_rect.is_some_and(|[l, top, r, b]| l <= p.x && p.x < r && top <= p.y && p.y < b);
+        if !inside {
+            unsafe {
+                let _ = KillTimer(msg_hwnd(), HOVER_TIMER);
+            }
+            t.hovering = false;
+            stop_tray_icon_timer();
+            return None;
+        }
+        if t.children.is_empty() {
+            t.start_window(t.hover_rect.map(middle), true);
+            return None;
+        }
+        t.children.last().and_then(|c| c.hwnd.map(|h| (c.pid, h)))
+    })
+    .flatten();
+    if let Some((pid, hwnd)) = target {
+        if window_pid(hwnd) == pid {
+            unsafe {
+                let _ = PostMessageW(HWND(hwnd as *mut _), proto::WINDOW_WARM, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
+/// See `TRAY_ICON_LEAVE_TIMER`. The next move over the icon starts it again.
+fn stop_tray_icon_timer() {
+    ICON.with(|i| {
+        if let Ok(i) = i.try_borrow() {
+            if let Some(icon) = i.as_ref() {
+                unsafe {
+                    let _ = KillTimer(HWND(icon.window_handle()), TRAY_ICON_LEAVE_TIMER);
+                }
+            }
+        }
+    });
 }
 
 fn quit(code: i32) -> ! {
@@ -394,11 +561,22 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         proto::TRAY_HELLO => {
-            with_tray(|t| {
-                if let Some(c) = t.children.iter_mut().find(|c| c.pid as usize == wp.0) {
-                    c.hwnd = Some(lp.0);
-                }
-            });
+            // Ready: its first frame is painted.
+            let pending = with_tray(|t| {
+                let c = t.children.iter_mut().find(|c| c.pid as usize == wp.0)?;
+                c.hwnd = Some(lp.0);
+                let ms = millis(c.started.elapsed());
+                test_event(|l| {
+                    l.ready += 1;
+                    l.frame_ms = Some(ms);
+                });
+                c.pending.take()
+            })
+            .flatten();
+            // A click came while it was getting ready.
+            if let Some(at) = pending {
+                open(Ask::Show, at);
+            }
             LRESULT(0)
         }
         proto::TRAY_RELOAD => LRESULT(with_tray(Tray::reload).map_or(0, proto::encode)),
@@ -412,7 +590,15 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         ),
         proto::TRAY_QUIT => quit(wp.0 as i32),
         proto::TRAY_SHOWN => {
-            test_event(|l| if wp.0 == 1 { l.shown += 1 } else { l.hidden += 1 });
+            let asked = if wp.0 == 1 { with_tray(|t| t.show_asked.take()).flatten() } else { None };
+            test_event(|l| {
+                if wp.0 == 1 {
+                    l.shown += 1;
+                    l.show_ms = asked.map(|t| millis(t.elapsed()));
+                } else {
+                    l.hidden += 1;
+                }
+            });
             LRESULT(0)
         }
         proto::TRAY_TEST => {
@@ -420,15 +606,21 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 proto::TEST_CLICK => open(Ask::Show, None),
                 proto::TEST_HIDE => open(Ask::Hide, None),
                 proto::TEST_TOGGLE => open(Ask::Toggle, None),
+                proto::TEST_HOVER => hover(None),
                 proto::TEST_KILL => {
                     with_tray(|t| {
-                        for c in &t.children {
+                        for c in &mut t.children {
+                            c.pending = None;
                             let _ = TerminateProcess(c.process, 9);
                         }
                     });
                 }
                 _ => {}
             }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == HOVER_TIMER => {
+            hover_tick();
             LRESULT(0)
         }
         WM_TIMER if wp.0 == TRIM_TIMER => {
@@ -521,15 +713,10 @@ fn create_tray() -> bool {
     let Ok(tray) = builder.build() else { return false };
     ICON.with(|t| *t.borrow_mut() = Some(tray));
 
-    TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| {
-        if let TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            rect,
-            position,
-            ..
-        } = e
-        {
+    TrayIconEvent::set_event_handler(Some(|e: TrayIconEvent| match e {
+        TrayIconEvent::Click {
+            button: MouseButton::Left, button_state: MouseButtonState::Up, rect, position, ..
+        } => {
             // The middle of the icon; where the click was if Windows gave no rectangle.
             let (x, y) = if rect.size.width > 0 && rect.size.height > 0 {
                 (rect.position.x + rect.size.width as f64 / 2.0, rect.position.y + rect.size.height as f64 / 2.0)
@@ -538,6 +725,14 @@ fn create_tray() -> bool {
             };
             open(Ask::Toggle, Some((x.round() as i32, y.round() as i32)));
         }
+        // tray-icon sends Enter only once until it saw the pointer leave, so every move counts.
+        TrayIconEvent::Enter { rect, .. } | TrayIconEvent::Move { rect, .. } => {
+            let (l, t) = (rect.position.x.round() as i32, rect.position.y.round() as i32);
+            let w = i32::try_from(rect.size.width).unwrap_or(0);
+            let h = i32::try_from(rect.size.height).unwrap_or(0);
+            hover((w > 0 && h > 0).then(|| [l, t, l.saturating_add(w), t.saturating_add(h)]));
+        }
+        _ => {}
     }));
     true
 }
@@ -603,6 +798,9 @@ pub fn run(cycle_test: Option<u32>, stress_test: Option<u32>) {
         no_tray: false,
         linger_ms: testing.then_some(TEST_LINGER_MS),
         testing,
+        hover_rect: None,
+        hovering: false,
+        show_asked: None,
     };
     TRAY.with(|t| *t.borrow_mut() = Some(tray));
     if !no_hotkey {
@@ -619,7 +817,7 @@ pub fn run(cycle_test: Option<u32>, stress_test: Option<u32>) {
         (None, Some(n)) => start_stress_test(n),
         // No tray icon: the window opens at once and stays open.
         (None, None) if no_tray => {
-            with_tray(|t| t.start_window(None));
+            with_tray(|t| t.start_window(None, false));
         }
         (None, None) => {}
     }
@@ -668,9 +866,20 @@ struct TestLog {
     exited: u32,
     shown: u32,
     hidden: u32,
+    /// Window processes that painted their first frame (`TRAY_HELLO`).
+    ready: u32,
+    /// The last one: ms from its start to its first painted frame.
+    frame_ms: Option<u32>,
+    /// The last show: ms from the click to the window on screen.
+    show_ms: Option<u32>,
 }
 
-static TEST: Mutex<TestLog> = Mutex::new(TestLog { started: 0, exited: 0, shown: 0, hidden: 0 });
+static TEST: Mutex<TestLog> =
+    Mutex::new(TestLog { started: 0, exited: 0, shown: 0, hidden: 0, ready: 0, frame_ms: None, show_ms: None });
+
+fn millis(d: Duration) -> u32 {
+    u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
+}
 static TEST_CHANGED: Condvar = Condvar::new();
 
 fn test_event(f: impl FnOnce(&mut TestLog)) {
@@ -759,15 +968,37 @@ fn test_end(code: i32, line: &str) -> ! {
     std::process::exit(code);
 }
 
+/// Median and largest value, for the timing lines.
+fn stats(v: &[u32]) -> Option<(u32, u32)> {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    Some((*v.get(v.len() / 2)?, *v.last()?))
+}
+
+fn report_times(what: &str, v: &[u32]) {
+    match stats(v) {
+        Some((median, max)) => {
+            report(&format!("cycle-test: {what}: median {median} ms, max {max} ms ({} runs)", v.len()))
+        }
+        None => report(&format!("cycle-test: {what}: no runs")),
+    }
+}
+
+/// The longest median show time for a warm window process (it is already painted).
+const WARM_SHOW_LIMIT_MS: u32 = 150;
+
 /// Runs beside the tray's message loop, like a user clicking the tray icon
-/// (the clicks ask for "show", so a window that hid itself cannot confuse it):
-/// each cycle starts the window process and waits until it painted, hides it,
-/// (every second cycle shows and hides it again in the same process), and
-/// waits until the process exited.
+/// (the clicks ask for "show", so a window that hid itself cannot confuse it).
+/// Odd cycles start the window process with the click (cold); even cycles
+/// start it as the pointer over the icon would (warm), wait until it has
+/// painted hidden, then click. Each time the window is hidden again (every
+/// fourth cycle shown and hidden once more in the same process), and the test
+/// waits until the process exited. At the end, three warm processes get no
+/// click and must exit by themselves.
 fn start_cycle_test(n: u32) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(1));
-        report(&format!("cycle-test: {n} cycles of start window process, show, hide, exit"));
+        report(&format!("cycle-test: {n} cycles of start window process (cold or warm), show, hide, exit"));
         // The tray trims its memory 2 s after the start: before and after.
         report_memory("tray start", memory_info());
         std::thread::sleep(Duration::from_millis(2500));
@@ -776,13 +1007,41 @@ fn start_cycle_test(n: u32) {
         let handles_start = handle_count();
         let marks = [n / 4, n / 2, n];
         let mut reused = 0;
+        let (mut cold_frame, mut cold_show, mut warm_frame, mut warm_show) = (vec![], vec![], vec![], vec![]);
         for c in 1..=n {
+            let warm = c.is_multiple_of(2);
             let before = test_log();
-            test_step(proto::TEST_CLICK);
             let wait = if c == 1 { Duration::from_secs(60) } else { Duration::from_secs(30) };
-            let opened = test_wait(wait, |l| l.shown > before.shown || l.exited > before.exited);
+            if warm {
+                test_step(proto::TEST_HOVER);
+                match test_wait(wait, |l| l.ready > before.ready || l.exited > before.exited) {
+                    Some(l) if l.ready > before.ready => warm_frame.extend(l.frame_ms),
+                    _ => test_end(
+                        1,
+                        &format!("cycle-test: FAIL: the warm window process did not get ready in cycle {c}"),
+                    ),
+                }
+                if test_log().shown > before.shown {
+                    test_end(
+                        1,
+                        &format!("cycle-test: FAIL: the warm window showed itself without a click in cycle {c}"),
+                    );
+                }
+            }
+            let before_click = test_log();
+            test_step(proto::TEST_CLICK);
+            let opened = test_wait(wait, |l| l.shown > before_click.shown || l.exited > before_click.exited);
             match opened {
-                Some(l) if l.shown > before.shown => {}
+                Some(l) if l.shown > before_click.shown => {
+                    if warm {
+                        warm_show.extend(l.show_ms);
+                    } else {
+                        cold_show.extend(l.show_ms);
+                        if l.ready > before.ready {
+                            cold_frame.extend(l.frame_ms);
+                        }
+                    }
+                }
                 _ if c == 1 => test_end(2, "cycle-test: the window did not open"),
                 _ => test_end(1, &format!("cycle-test: FAIL: the window did not open in cycle {c}")),
             }
@@ -799,7 +1058,7 @@ fn start_cycle_test(n: u32) {
                 }
             };
             hide("first");
-            if c.is_multiple_of(2) {
+            if c.is_multiple_of(4) {
                 let before = test_log();
                 test_step(proto::TEST_CLICK);
                 match test_wait(Duration::from_secs(30), |l| l.shown > before.shown) {
@@ -814,6 +1073,21 @@ fn start_cycle_test(n: u32) {
             }
             if marks.contains(&c) {
                 report_memory(&format!("cycle {c}"), memory_info());
+            }
+        }
+        // Warm processes without a click exit by themselves, never shown.
+        for w in 1..=3 {
+            let before = test_log();
+            test_step(proto::TEST_HOVER);
+            if test_wait(Duration::from_secs(30), |l| l.ready > before.ready).is_none() {
+                test_end(1, &format!("cycle-test: FAIL: warm window process {w} did not get ready"));
+            }
+            let limit = crate::lifetime::WARM + Duration::from_secs(10);
+            if test_wait(limit, |l| l.exited == l.started).is_none() {
+                test_end(1, &format!("cycle-test: FAIL: warm window process {w} did not exit without a click"));
+            }
+            if test_log().shown > before.shown {
+                test_end(1, &format!("cycle-test: FAIL: warm window process {w} showed itself"));
             }
         }
         report_memory("last exit", memory_info());
@@ -831,8 +1105,12 @@ fn start_cycle_test(n: u32) {
         report(&format!(
             "cycle-test: {} window processes started, {reused} of {} re-shown in the same process, {leftover} left over",
             l.started,
-            n / 2
+            n / 4
         ));
+        report_times("cold start: start window process to first painted frame", &cold_frame);
+        report_times("cold start: click to window on screen", &cold_show);
+        report_times("warm: start window process to first painted frame (hidden)", &warm_frame);
+        report_times("warm: show request to window on screen", &warm_show);
         let growth = match (start, end) {
             (Some(a), Some(b)) => b.0 as f64 / MB - a.0 as f64 / MB,
             _ => f64::INFINITY,
@@ -843,6 +1121,15 @@ fn start_cycle_test(n: u32) {
         }
         if growth > 1.0 {
             test_end(1, "cycle-test: FAIL: the tray's PrivateUsage grew by more than 1 MB");
+        }
+        match stats(&warm_show) {
+            Some((median, _)) if median <= WARM_SHOW_LIMIT_MS => {}
+            Some((median, _)) => test_end(
+                1,
+                &format!("cycle-test: FAIL: a warm window took {median} ms (median) to show, more than {WARM_SHOW_LIMIT_MS} ms"),
+            ),
+            None if n >= 2 => test_end(1, "cycle-test: FAIL: no warm show was timed"),
+            None => {}
         }
         test_end(0, "cycle-test: PASS");
     });
@@ -868,25 +1155,28 @@ fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
 }
 
-/// `--stress-test N`: N times, click the tray icon (sometimes several times in a
-/// row), wait a random time (while the window process starts, paints, shows,
-/// hides or exits), sometimes hide it, then kill every window process. The
-/// tray must survive, have no window process left and not keep more handles.
+/// `--stress-test N`: N times, click the tray icon or move the pointer over it
+/// (one to three times in a row, so warm and cold starts, clicks while a warm
+/// process gets ready and clicks on a shown window mix), wait a random time
+/// (while the window process starts, paints, shows, hides or exits),
+/// sometimes hide it, then kill every window process. The tray must survive,
+/// have no window process left and not keep more handles.
 fn start_stress_test(n: u32) {
     std::thread::spawn(move || {
         sleep_ms(3000);
         let seed =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
         let mut rng = Rng(seed | 1);
-        report(&format!("stress-test: {n} rounds of click, random wait, kill (seed {seed})"));
+        report(&format!("stress-test: {n} rounds of click or hover, random wait, kill (seed {seed})"));
         report_memory("tray idle", memory_info());
         let mut base = None;
         let mut shown = 0;
         for c in 1..=n {
             let before = test_log();
             for _ in 0..1 + rng.below(3) {
-                test_step(proto::TEST_TOGGLE);
-                sleep_ms(rng.below(40));
+                let step = [proto::TEST_TOGGLE, proto::TEST_HOVER, proto::TEST_CLICK][rng.below(3) as usize];
+                test_step(step);
+                sleep_ms(rng.below(if step == proto::TEST_HOVER { 600 } else { 40 }));
             }
             sleep_ms(rng.below(2500));
             if rng.below(3) == 0 {

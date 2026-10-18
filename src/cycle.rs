@@ -1,7 +1,7 @@
 //! Which device comes next when the hotkey is pressed. Pure, no Windows calls.
 
 /// One active playback device.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Device {
     /// Windows endpoint id (stable, used to set the default).
     pub id: String,

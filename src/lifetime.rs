@@ -1,11 +1,16 @@
 //! When the window process shows, hides and exits. A hidden window waits
 //! `linger` (30 s) for another tray click, then its process exits; nothing runs
-//! while it waits. Pure, no Windows calls.
+//! while it waits. A "warm" process, started while the pointer is over the
+//! tray icon, waits `WARM` (5 s) after the pointer was last seen there.
+//! Pure, no Windows calls.
 
 use std::time::{Duration, Instant};
 
 /// How long a hidden window waits for the next tray click.
 pub const LINGER: Duration = Duration::from_secs(30);
+/// A warm process (or a hidden one about to exit) stays at least this long
+/// after the pointer was last over the tray icon.
+pub const WARM: Duration = Duration::from_secs(5);
 /// A tray click that follows a click-away hide must not reopen the window.
 pub const REOPEN_GUARD: Duration = Duration::from_millis(400);
 
@@ -34,14 +39,28 @@ pub struct Lifetime {
     hidden_at: Option<Instant>,
     /// When it last hid itself because it lost focus.
     click_away_at: Option<Instant>,
+    /// The pointer was over the tray icon: no exit before this.
+    warm_until: Option<Instant>,
     exiting: bool,
 }
 
 impl Lifetime {
     /// A new window process: not shown yet, and no exit planned until it was
-    /// shown and hidden again.
+    /// shown and hidden again (or, if it is warm, until `warm` ran out).
     pub fn new(linger: Duration) -> Self {
-        Lifetime { linger, visible: false, hidden_at: None, click_away_at: None, exiting: false }
+        Lifetime { linger, visible: false, hidden_at: None, click_away_at: None, warm_until: None, exiting: false }
+    }
+
+    /// Shown (or about to be, as soon as its first frame is painted).
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    /// The pointer is over the tray icon: stay at least `WARM` from `now`.
+    pub fn warm(&mut self, now: Instant) {
+        if let Some(t) = now.checked_add(WARM) {
+            self.warm_until = Some(self.warm_until.map_or(t, |w| w.max(t)));
+        }
     }
 
     pub fn shown(&mut self) {
@@ -78,9 +97,13 @@ impl Lifetime {
     /// When the process exits if nothing happens before (None also for a
     /// linger too long for the clock: then it never exits by itself).
     pub fn deadline(&self) -> Option<Instant> {
-        match (self.exiting, self.visible, self.hidden_at) {
-            (false, false, Some(t)) => t.checked_add(self.linger),
-            _ => None,
+        if self.exiting || self.visible {
+            return None;
+        }
+        match (self.hidden_at, self.warm_until) {
+            // A linger too long for the clock: it never exits by itself.
+            (Some(t), w) => t.checked_add(self.linger).map(|d| w.map_or(d, |w| d.max(w))),
+            (None, w) => w,
         }
     }
 
@@ -179,6 +202,55 @@ mod tests {
         assert_eq!(l.ask(Ask::Toggle, t0 + LINGER), Some(Do::Show));
     }
 
+    #[test]
+    fn warm_process_exits_after_warm_unless_shown() {
+        let mut l = Lifetime::new(LINGER);
+        let t0 = Instant::now();
+        l.warm(t0);
+        assert!(!l.visible());
+        assert_eq!(l.deadline(), Some(t0 + WARM));
+        // The pointer is still there a second later: 5 s from then.
+        l.warm(t0 + 1000 * MS);
+        assert_eq!(l.deadline(), Some(t0 + 1000 * MS + WARM));
+        // An older report never shortens it.
+        l.warm(t0);
+        assert_eq!(l.deadline(), Some(t0 + 1000 * MS + WARM));
+        assert!(!l.expire(t0 + WARM));
+        assert!(l.expire(t0 + 1000 * MS + WARM));
+        assert_eq!(l.ask(Ask::Toggle, t0 + 10 * WARM), None);
+    }
+
+    #[test]
+    fn a_click_on_a_warm_process_shows_it_and_then_linger_counts() {
+        let mut l = Lifetime::new(LINGER);
+        let t0 = Instant::now();
+        l.warm(t0);
+        assert_eq!(l.ask(Ask::Toggle, t0 + MS), Some(Do::Show));
+        l.shown();
+        assert_eq!(l.deadline(), None);
+        assert!(!l.expire(t0 + WARM * 2));
+        let t1 = t0 + WARM * 3;
+        l.hidden(t1, false);
+        assert_eq!(l.deadline(), Some(t1 + LINGER));
+        // The pointer over the icon near the end of the linger: at least 5 s more.
+        let t2 = t1 + LINGER - MS;
+        l.warm(t2);
+        assert_eq!(l.deadline(), Some(t2 + WARM));
+        assert!(!l.expire(t1 + LINGER));
+    }
+
+    #[test]
+    fn a_cold_process_is_visible_from_the_start() {
+        let mut l = Lifetime::new(LINGER);
+        let t0 = Instant::now();
+        l.shown();
+        assert!(l.visible());
+        // Hover reports while it opens never end it.
+        l.warm(t0);
+        assert_eq!(l.deadline(), None);
+        assert!(!l.expire(t0 + WARM * 10));
+    }
+
     /// Random asks and events: the answers always fit the state, and once it
     /// is exiting it stays exiting.
     #[test]
@@ -198,7 +270,8 @@ mod tests {
             let mut exiting = false;
             for _ in 0..200 {
                 now += Duration::from_millis(next() % 700);
-                match next() % 6 {
+                match next() % 7 {
+                    6 => l.warm(now),
                     0 => {
                         l.shown();
                         shown = true;
