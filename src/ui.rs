@@ -2,7 +2,7 @@
 //! buttons as Brightness Lite. Drawing never calls Windows audio; what the user
 //! does comes back as a list of `Action`s.
 
-use crate::engine::{Model, Target};
+use crate::model::{Model, Target};
 use crate::{cycle, hotkey, volume};
 use eframe::egui::{
     self, Align, Button, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Sense, Slider, Stroke,
@@ -225,7 +225,18 @@ fn volume_row(
         ui.spacing_mut().slider_width = ui.available_width() - 32.0 - ui.spacing().item_spacing.x;
         // egui's Slider ignores the mouse wheel, so the wheel always scrolls the
         // window, also over a slider or a mute button.
+        let before = v;
         let resp = ui.add(Slider::new(&mut v, 0.0..=100.0).show_value(false).trailing_fill(true));
+        // egui moves a free slider by one point per arrow key, which is less than
+        // 1 %, so the number did not always change: one key, one percent.
+        if resp.has_focus() {
+            let presses = |a: egui::Key, b: egui::Key| ui.input(|i| i.num_presses(a) + i.num_presses(b));
+            let up = presses(egui::Key::ArrowRight, egui::Key::ArrowUp);
+            let down = presses(egui::Key::ArrowLeft, egui::Key::ArrowDown);
+            if up != down {
+                v = volume::step(before, up as i64 - down as i64);
+            }
+        }
         if resp.dragged() {
             st.drag = Some((t.clone(), v));
             if resp.changed() {

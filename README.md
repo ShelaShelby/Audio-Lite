@@ -98,6 +98,13 @@ click starts the window part; after the window is closed it waits 30 s for
 the next click, doing nothing, then exits and gives all its memory back to
 Windows (graphics driver memory too), so nothing can pile up over time.
 
+To open at once, the window part is started as soon as the pointer moves
+over the tray icon: it gets ready and draws itself hidden, so the click only
+has to show it. If no click comes, it exits 5 s after the pointer left the
+icon. While it waits it uses no CPU. The window also shows the devices and
+volumes from last time (kept in `cache.json` next to `settings.json`) until
+Windows has told it the current ones, a moment later.
+
 ## Settings file
 
 You do not need to touch it. The window writes it when you change the
@@ -111,8 +118,13 @@ this:
 }
 ```
 
-- `hotkey`: the hotkey.
+- `hotkey`: the hotkey. Shift alone only works with F1 to F24 (Shift + a
+  letter would take that letter away from typing).
 - `exclude`: the devices with "In hotkey cycle" unticked.
+
+`cache.json` in the same folder holds the devices and volumes the window
+showed last; it is written when the window closes and can be deleted at
+any time.
 
 Where the file is:
 
@@ -170,6 +182,12 @@ Real sound and the look have to be tried on a real PC:
 - [ ] Open and close the window: 30 s later only one `audio-lite.exe` is
       left in Task Manager, and opening and closing many times does not make
       it grow. A click within those 30 s opens the window at once.
+- [ ] Move the pointer onto the tray icon and click: the window is there at
+      once. Move the pointer over the icon without clicking: a second
+      `audio-lite.exe` appears and is gone about 5 s after the pointer left;
+      the window you were typing in keeps the focus.
+- [ ] With "Automatically hide the taskbar" on: the window opens above the
+      taskbar, not over it.
 - [ ] End the tray `audio-lite.exe` in Task Manager while the window is
       open: the window goes away too.
 - [ ] The dark theme matches Brightness Lite (cards, blue sliders, round

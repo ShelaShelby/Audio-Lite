@@ -12,6 +12,9 @@ pub struct WindowArgs {
     pub linger_ms: Option<u64>,
     /// The tray icon could not be made: the window stays open and its X quits.
     pub no_tray: bool,
+    /// Started while the pointer is over the tray icon: get ready hidden, show
+    /// only when asked, and exit if no click comes (see `lifetime::WARM`).
+    pub warm: bool,
 }
 
 /// The longest `--linger-ms` taken (a day); more would overflow the exit time.
@@ -45,6 +48,7 @@ pub fn parse(args: &[String]) -> Mode {
         match a.as_str() {
             "--window" => window = true,
             "--no-tray" => w.no_tray = true,
+            "--warm" => w.warm = true,
             "--parent" => w.parent = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--at" => w.at = it.next().and_then(|v| point(v)),
             "--linger-ms" => w.linger_ms = it.next().and_then(|v| v.parse().ok()).map(|ms: u64| ms.min(MAX_LINGER_MS)),
@@ -71,6 +75,9 @@ pub fn window_args(w: &WindowArgs) -> Vec<String> {
     }
     if w.no_tray {
         out.push("--no-tray".to_string());
+    }
+    if w.warm {
+        out.push("--warm".to_string());
     }
     out
 }
@@ -119,18 +126,21 @@ mod tests {
     #[test]
     fn window_arguments() {
         let m = parse(&v("--window --parent 1234 --at -1910,1050 --linger-ms 500 --no-tray"));
-        let want = WindowArgs { parent: 1234, at: Some((-1910, 1050)), linger_ms: Some(500), no_tray: true };
+        let want =
+            WindowArgs { parent: 1234, at: Some((-1910, 1050)), linger_ms: Some(500), no_tray: true, warm: false };
         assert_eq!(m, Mode::Window(want));
         let m = parse(&v("--parent 7 --window --at 5"));
         assert_eq!(m, Mode::Window(WindowArgs { parent: 7, ..Default::default() }));
+        let m = parse(&v("--window --warm --parent 9"));
+        assert_eq!(m, Mode::Window(WindowArgs { parent: 9, warm: true, ..Default::default() }));
     }
 
     #[test]
     fn round_trip() {
         for w in [
             WindowArgs { parent: 1, ..Default::default() },
-            WindowArgs { parent: 99999, at: Some((0, -3)), linger_ms: None, no_tray: false },
-            WindowArgs { parent: 42, at: Some((3839, 2159)), linger_ms: Some(1000), no_tray: true },
+            WindowArgs { parent: 99999, at: Some((0, -3)), linger_ms: None, no_tray: false, warm: true },
+            WindowArgs { parent: 42, at: Some((3839, 2159)), linger_ms: Some(1000), no_tray: true, warm: false },
         ] {
             assert_eq!(parse(&window_args(&w)), Mode::Window(w.clone()));
             let line = command_line("C:\\My Tools\\audio-lite.exe", &w);
@@ -163,6 +173,7 @@ mod tests {
             "--at",
             "--linger-ms",
             "--no-tray",
+            "--warm",
             "--cycle-test",
             "--stress-test",
             "",

@@ -42,15 +42,31 @@ pub fn parse(text: Option<&str>) -> Settings {
     s
 }
 
+/// Larger files are taken as broken (nothing the app writes comes close).
+pub const MAX_FILE_BYTES: u64 = 1 << 20;
+
 /// The text of the file. `Ok(None)`: there is no file (or no path). `Err`: it
 /// exists but could not be read right now; then the settings in use are kept.
 pub fn read(path: Option<&Path>) -> std::io::Result<Option<String>> {
+    read_text(path, MAX_FILE_BYTES).map(|t| t.map(|t| t.unwrap_or_default()))
+}
+
+/// A small text file: `Ok(None)` if it is missing, `Ok(Some(None))` if it is
+/// larger than `max` bytes (read as broken, never loaded into memory).
+pub fn read_text(path: Option<&Path>, max: u64) -> std::io::Result<Option<Option<String>>> {
+    use std::io::Read;
     let Some(path) = path else { return Ok(None) };
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut bytes = Vec::new();
+    f.by_ref().take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Ok(Some(None));
     }
+    Ok(Some(Some(String::from_utf8_lossy(&bytes).into_owned())))
 }
 
 pub fn to_json(s: &Settings) -> String {
@@ -58,9 +74,14 @@ pub fn to_json(s: &Settings) -> String {
 }
 
 /// Write the file, making its folder if needed. Only called after the user
-/// changed something in the window. Written to a temporary file first and then
-/// renamed over the old one, so a crash or a reader never sees half a file.
+/// changed something in the window.
 pub fn save(path: &Path, s: &Settings) -> std::io::Result<()> {
+    write_atomic(path, to_json(s).as_bytes(), true)
+}
+
+/// Written to a temporary file first and then renamed over the old one, so a
+/// crash or a reader never sees half a file. `sync`: also wait until it is on disk.
+pub fn write_atomic(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -69,8 +90,11 @@ pub fn save(path: &Path, s: &Settings) -> std::io::Result<()> {
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
-        f.write_all(to_json(s).as_bytes())?;
-        f.sync_all()
+        f.write_all(bytes)?;
+        if sync {
+            f.sync_all()?;
+        }
+        Ok(())
     });
     let res = written.and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
@@ -117,10 +141,13 @@ pub fn parse_hotkey(text: &str) -> Option<(u32, u32)> {
         }
         key = Some(key_code(&part)?);
     }
-    if mods == 0 {
+    let key = key?;
+    // Shift alone with a letter or digit would take that character away from
+    // typing everywhere; F1 to F24 are fine.
+    if mods & !MOD_SHIFT == 0 && !(0x70..=0x87).contains(&key) {
         return None;
     }
-    Some((mods, key?))
+    Some((mods, key))
 }
 
 fn key_code(name: &str) -> Option<u32> {
@@ -242,6 +269,15 @@ mod tests {
         assert_eq!(names, vec![std::ffi::OsString::from(FILE_NAME)]);
         assert_eq!(read(Some(&dir.join("missing.json"))).unwrap(), None);
         assert_eq!(read(None).unwrap(), None);
+        // A huge file is read as broken (the defaults), never loaded whole.
+        let huge = dir.join("huge.json");
+        std::fs::write(&huge, vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
+        assert_eq!(read(Some(&huge)).unwrap(), Some(String::new()));
+        assert_eq!(read_text(Some(&huge), 10).unwrap(), Some(None));
+        std::fs::write(&huge, b"0123456789").unwrap();
+        assert_eq!(read_text(Some(&huge), 10).unwrap(), Some(Some("0123456789".into())));
+        write_atomic(&huge, b"x", false).unwrap();
+        assert_eq!(read_text(Some(&huge), 10).unwrap(), Some(Some("x".into())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -255,6 +291,13 @@ mod tests {
         assert_eq!(parse_hotkey("Ctrl+A+B"), None);
         assert_eq!(parse_hotkey("Ctrl+F25"), None);
         assert_eq!(parse_hotkey("Ctrl+Space"), None);
+        // Shift alone only with an F key: Shift+A would take "A" away from typing.
+        assert_eq!(parse_hotkey("Shift+A"), None);
+        assert_eq!(parse_hotkey("Shift+7"), None);
+        assert_eq!(parse_hotkey("Shift+F9"), Some((MOD_SHIFT, 0x78)));
+        assert_eq!(parse_hotkey("Shift+F24"), Some((MOD_SHIFT, 0x87)));
+        assert_eq!(parse_hotkey("Win+Shift+A"), Some((MOD_WIN | MOD_SHIFT, 'A' as u32)));
+        assert_eq!(parse_hotkey("Alt+Shift+1"), Some((MOD_ALT | MOD_SHIFT, '1' as u32)));
         assert_eq!(parse_hotkey(""), None);
     }
 

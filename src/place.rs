@@ -30,6 +30,40 @@ pub fn place(wa: Area, size: (i32, i32), at: Option<(i32, i32)>) -> (i32, i32) {
     (fit(x), fit(y))
 }
 
+/// The farthest the middle of a tray icon is from the screen edge in a taskbar
+/// (a tall taskbar at 200 % or more is still well below this).
+const MAX_BAR_HALF: i64 = 160;
+
+/// The work area without the taskbar. Normally Windows leaves the taskbar out
+/// of it already, and the tray icon at `at` is outside. A taskbar that hides
+/// itself is not left out: then the icon is inside, near one edge, and that
+/// edge is moved in by twice the icon's distance from it (the taskbar's
+/// height), so the window does not cover the taskbar while it is shown.
+pub fn avoid_taskbar(wa: Area, at: Option<(i32, i32)>) -> Area {
+    let Some((x, y)) = at else { return wa };
+    let (x, y) = (i64::from(x), i64::from(y));
+    let (mut l, mut t, mut r, mut b) =
+        (i64::from(wa.left), i64::from(wa.top), i64::from(wa.right), i64::from(wa.bottom));
+    if !(l <= x && x < r && t <= y && y < b) {
+        return wa;
+    }
+    // Distance to each edge: left, right, top, bottom.
+    let sides = [x - l, r - x, y - t, b - y];
+    let (side, d) = sides.iter().copied().enumerate().min_by_key(|&(_, d)| d).unwrap_or((3, 0));
+    if d > MAX_BAR_HALF {
+        return wa;
+    }
+    let (w, h) = (r - l, b - t);
+    match side {
+        0 => l += (2 * d).min(w / 2),
+        1 => r -= (2 * d).min(w / 2),
+        2 => t += (2 * d).min(h / 2),
+        _ => b -= (2 * d).min(h / 2),
+    }
+    let fit = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    Area { left: fit(l), top: fit(t), right: fit(r), bottom: fit(b) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +127,46 @@ mod tests {
                 assert!(x >= wa.left && y >= wa.top);
                 assert_eq!(x == wa.left + EDGE, left || (wa.right - w - EDGE) == wa.left + EDGE);
                 assert_eq!(y == wa.top + EDGE, top || (wa.bottom - h - EDGE) == wa.top + EDGE);
+            }
+        }
+    }
+
+    #[test]
+    fn a_normal_taskbar_is_already_outside_the_work_area() {
+        // Bottom taskbar, icon below the work area: nothing changes.
+        assert_eq!(avoid_taskbar(WA, Some((1800, 1060))), WA);
+        assert_eq!(avoid_taskbar(WA, None), WA);
+        // Far inside (not near an edge): not a taskbar.
+        assert_eq!(avoid_taskbar(WA, Some((900, 500))), WA);
+    }
+
+    #[test]
+    fn an_auto_hidden_taskbar_is_left_out_on_every_side() {
+        let full = Area { left: 0, top: 0, right: 1920, bottom: 1080 };
+        // Icon 24 px from the bottom: a 48 px taskbar.
+        let a = avoid_taskbar(full, Some((1800, 1056)));
+        assert_eq!(a, Area { bottom: 1032, ..full });
+        let (x, y) = place(a, (360, 500), Some((1800, 1056)));
+        assert_eq!((x, y), (1920 - 360 - EDGE, 1032 - 500 - EDGE));
+        assert_eq!(avoid_taskbar(full, Some((1800, 24))), Area { top: 48, ..full });
+        assert_eq!(avoid_taskbar(full, Some((30, 900))), Area { left: 60, ..full });
+        assert_eq!(avoid_taskbar(full, Some((1890, 900))), Area { right: 1860, ..full });
+        // A second monitor left of the main one.
+        let left = Area { left: -1920, top: 0, right: 0, bottom: 1080 };
+        assert_eq!(avoid_taskbar(left, Some((-100, 1056))), Area { bottom: 1032, ..left });
+    }
+
+    #[test]
+    fn avoid_taskbar_never_overflows_or_inverts() {
+        let all = [i32::MIN, -1, 0, 1, 100, 1920, i32::MAX];
+        for &a in &all {
+            for &b in &all {
+                let wa = Area { left: a.min(b), top: a.min(b), right: a.max(b), bottom: a.max(b) };
+                for at in [None, Some((a, b)), Some((b, a)), Some((a, a)), Some((0, 0))] {
+                    let r = avoid_taskbar(wa, at);
+                    assert!(r.left <= r.right && r.top <= r.bottom, "{wa:?} {at:?}");
+                    assert!(r.left >= wa.left && r.right <= wa.right && r.top >= wa.top && r.bottom <= wa.bottom);
+                }
             }
         }
     }

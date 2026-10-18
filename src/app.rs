@@ -4,10 +4,18 @@
 //! a tray click) it waits 30 s for the next click with nothing running, then
 //! the process exits, and all its memory, OpenGL included, goes back to
 //! Windows. It also exits as soon as the tray process is gone.
+//!
+//! Started "warm" (`--warm`, the pointer is over the tray icon) it does all of
+//! its start-up and paints its first frame hidden, then waits with nothing
+//! running: a click only has to show it. Without a click it exits 5 s after
+//! the pointer left the icon. The first frame never waits for Windows audio:
+//! it shows the last devices and volumes from cache.json until the audio
+//! thread has read them.
 
 use crate::args::WindowArgs;
 use crate::engine::Engine;
 use crate::lifetime::{Do, Lifetime, LINGER};
+use crate::model::{self, Model};
 use crate::place::{self, Area, EDGE};
 use crate::proto::{self, HotkeyStatus};
 use crate::settings::{self, Settings};
@@ -18,7 +26,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
@@ -83,6 +91,9 @@ struct Prefs {
     hotkey_error: Option<String>,
     startup: bool,
     startup_error: Option<String>,
+    /// cache.json, and what it has now (written only when that changed).
+    cache_path: Option<PathBuf>,
+    cache_text: String,
 }
 
 thread_local! {
@@ -100,9 +111,10 @@ fn with_life<R>(f: impl FnOnce(&mut Lifetime) -> R) -> Option<R> {
     LIFE.with(|l| l.try_borrow_mut().ok().map(|mut l| f(&mut l)))
 }
 
-/// The audio thread; started on first use, so this can never fail.
+/// The audio thread; started in `run` with the cached model (or on first use),
+/// so this can never fail.
 fn engine() -> &'static Engine {
-    ENGINE.get_or_init(|| Engine::start(model_changed, model_changed))
+    ENGINE.get_or_init(|| Engine::start(model_changed, model_changed, Model::default()))
 }
 
 fn hwnd() -> HWND {
@@ -185,7 +197,13 @@ fn schedule_uncloak(at: Option<Instant>) {
     UNCLOAK_CHANGED.notify_one();
 }
 
+/// Started when the window is first shown (a warm process that is never shown does not need it).
 fn start_timer() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(spawn_timer);
+}
+
+fn spawn_timer() {
     // Builder, not thread::spawn: that one panics (aborts) if Windows refuses a thread.
     let _ = std::thread::Builder::new().spawn(|| loop {
         // Never hold the lock during a Win32 call: the window thread may be
@@ -241,7 +259,7 @@ fn work_area() -> Area {
             );
         }
     }
-    Area { left: wa.left, top: wa.top, right: wa.right, bottom: wa.bottom }
+    place::avoid_taskbar(Area { left: wa.left, top: wa.top, right: wa.right, bottom: wa.bottom }, at)
 }
 
 /// In the corner of the work area next to the tray. Also called when the
@@ -272,12 +290,13 @@ fn load_prefs(p: &mut Prefs) {
 }
 
 fn show_window() {
+    with_life(|l| l.shown());
     if !READY.load(Ordering::Relaxed) {
         // The first frame is not painted yet: it opens as soon as it is.
         repaint();
         return;
     }
-    with_life(|l| l.shown());
+    start_timer();
     unsafe {
         let _ = KillTimer(msg_hwnd(), EXIT_TIMER);
     }
@@ -312,7 +331,14 @@ fn hide_window(click_away: bool) {
     unsafe {
         let _ = ShowWindow(hwnd(), SW_HIDE);
     }
+    // Hidden before its first frame was on screen: nothing may uncloak it
+    // later or report it as shown.
+    if AWAIT_FRAME.swap(false, Ordering::Relaxed) | UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
+        schedule_uncloak(None);
+        cloak(false);
+    }
     engine().set_live(false);
+    save_cache();
     // A hotkey change left half done: the tray takes the saved hotkey again.
     with_prefs(|p| {
         if p.status.is_some_and(|s| s.paused) {
@@ -322,6 +348,22 @@ fn hide_window(click_away: bool) {
     with_life(|l| l.hidden(Instant::now(), click_away));
     tray_post(proto::TRAY_SHOWN, 0, 0);
     arm_exit_timer();
+}
+
+/// What the window shows now, for the next window process to paint at once.
+fn save_cache() {
+    let text = model::to_cache(&engine().model());
+    with_prefs(|p| {
+        if text == p.cache_text {
+            return;
+        }
+        // No sync to disk: a cut-off file after a power cut is just ignored.
+        if let Some(path) = &p.cache_path {
+            if settings::write_atomic(path, text.as_bytes(), false).is_ok() {
+                p.cache_text = text;
+            }
+        }
+    });
 }
 
 fn arm_exit_timer() {
@@ -418,6 +460,14 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
                 Some(Do::Nothing) => LRESULT(proto::OPEN_NOTHING),
             }
+        }
+        proto::WINDOW_WARM => {
+            // The pointer is over the tray icon: a click may come.
+            with_life(|l| l.warm(Instant::now()));
+            if READY.load(Ordering::Relaxed) {
+                arm_exit_timer();
+            }
+            LRESULT(0)
         }
         WM_TIMER if wp.0 == EXIT_TIMER => {
             let _ = KillTimer(hwnd, EXIT_TIMER);
@@ -525,7 +575,8 @@ impl eframe::App for AudioApp {
         }
 
         // First frame is done: hide the window again (eframe shows it after the
-        // first paint), tell the tray this process is there, and open it.
+        // first paint), tell the tray this process is there, and open it (a
+        // warm process waits for a click, or exits when none comes).
         if !READY.load(Ordering::Relaxed) && FIRST_FRAME.load(Ordering::Relaxed) {
             unsafe {
                 let _ = ShowWindow(hwnd(), SW_HIDE);
@@ -533,7 +584,11 @@ impl eframe::App for AudioApp {
             cloak(false);
             READY.store(true, Ordering::Relaxed);
             tray_post(proto::TRAY_HELLO, unsafe { GetCurrentProcessId() } as usize, msg_hwnd().0 as isize);
-            show_window();
+            if with_life(|l| l.visible()).unwrap_or(true) {
+                show_window();
+            } else {
+                arm_exit_timer();
+            }
         }
         if UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
             schedule_uncloak(None);
@@ -584,8 +639,9 @@ impl eframe::App for AudioApp {
         let model = engine().model();
         let ppp = ui.ctx().pixels_per_point();
         let wa = work_area();
-        // Room for the title bar too.
-        let max_h = ((wa.bottom - wa.top - 2 * EDGE) as f32 / ppp - 40.0).max(200.0);
+        // Room for the title bar too. In i64: any monitor layout fits.
+        let px = i64::from(wa.bottom) - i64::from(wa.top) - 2 * i64::from(EDGE);
+        let max_h = (px as f32 / ppp - 40.0).max(200.0);
         let was_recording = self.ui.recording;
         let actions = with_prefs(|p| {
             let (hotkey, problem) = proto::hotkey_view(&p.settings.hotkey, p.status);
@@ -668,34 +724,52 @@ pub fn run(args: WindowArgs) {
     }
     NO_TRAY.store(args.no_tray, Ordering::Relaxed);
     *AT.lock().unwrap_or_else(|e| e.into_inner()) = args.at;
-    if let Some(ms) = args.linger_ms {
-        with_life(|l| *l = Lifetime::new(Duration::from_millis(ms)));
-    }
+    with_life(|l| {
+        if let Some(ms) = args.linger_ms {
+            *l = Lifetime::new(Duration::from_millis(ms));
+        }
+        // A cold start opens as soon as it is painted; a warm one waits for a click.
+        if args.warm {
+            l.warm(Instant::now());
+        } else {
+            l.shown();
+        }
+    });
     if !create_msg_window() {
         return;
     }
 
-    // Starts the audio thread; the first read runs in the background.
-    let _ = engine();
-
+    // The last devices and volumes, so the first frame never waits for Windows audio.
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-    let mut prefs = Prefs {
-        settings: Settings::default(),
-        path: settings::choose_path(exe_dir.as_deref(), appdata.as_deref(), |p| p.exists()),
-        status: None,
+    let path = settings::choose_path(exe_dir.as_deref(), appdata.as_deref(), |p| p.exists());
+    let cache_path = path.as_ref().map(|p| p.with_file_name(model::CACHE_FILE));
+    let cached = settings::read_text(cache_path.as_deref(), model::MAX_FILE_BYTES).ok().flatten().flatten();
+    let first = model::from_cache(cached.as_deref()).unwrap_or_default();
+    let cache_text = model::to_cache(&first);
+    // Starts the audio thread; it reads the default device and its volume
+    // first, while the window is made.
+    let _ = ENGINE.set(Engine::start(model_changed, model_changed, first));
+
+    // Only what the first frame needs. The tray's hotkey state and the Run
+    // entry are read when the window is shown.
+    let settings = settings::read(path.as_deref()).ok().map(|t| settings::parse(t.as_deref())).unwrap_or_default();
+    let prefs = Prefs {
+        settings,
+        path,
+        status: Some(HotkeyStatus::default()),
         hotkey_error: None,
         startup: false,
-        startup_error: None,
+        startup_error: args.no_tray.then(|| "The tray icon could not be made, so the window stays open.".into()),
+        cache_path,
+        cache_text,
     };
-    load_prefs(&mut prefs);
-    if args.no_tray {
-        prefs.startup_error = Some("The tray icon could not be made, so the window stays open.".into());
-    }
     PREFS.with(|p| *p.borrow_mut() = Some(prefs));
 
     let icon = egui::IconData { rgba: icon::rgba(32), width: 32, height: 32 };
     // No depth, stencil or multisampling buffers: egui needs none of them.
+    // Not activated by eframe's own first show: a warm window must never take
+    // the focus (show_window brings it to the front when it is opened).
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Audio Lite")
@@ -706,6 +780,7 @@ pub fn run(args: WindowArgs) {
             .with_minimize_button(false)
             .with_always_on_top()
             .with_taskbar(false)
+            .with_active(false)
             .with_visible(false),
         depth_buffer: 0,
         stencil_buffer: 0,
@@ -726,7 +801,6 @@ pub fn run(args: WindowArgs) {
             }
             // eframe shows the window after its first paint; keep that invisible.
             cloak(true);
-            start_timer();
             Ok(Box::new(AudioApp { ui: ui::UiState::default(), armed: false, last_poll: None }))
         }),
     );
