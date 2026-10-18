@@ -40,7 +40,8 @@ jobs:
       # cold and warm starts. The app itself fails the test (no
       # "cycle-test: PASS") if the tray grew by more than 1 MB, a window
       # process is left over, or a warm window takes more than 150 ms (median)
-      # to show; the runner has no GPU, so the cold numbers are for
+      # to show (request sent to window uncloaked; the window process reports
+      # its own steps, also printed); the runner has no GPU, so the cold numbers are for
       # information only. It also fails if the test does not finish.
       - name: Cycle test (cold and warm start/show/hide/exit x100, memory, timing)
         timeout-minutes: 20

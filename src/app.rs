@@ -350,6 +350,17 @@ fn show_window() {
         c.request_repaint();
     }
     show_step(1);
+    // Windows usually paints it while it is shown (the frame is already done): on screen now.
+    if UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
+        on_screen();
+    }
+}
+
+/// The window's first frame since it was shown is painted: uncloak it.
+fn on_screen() {
+    schedule_uncloak(None);
+    cloak(false);
+    tray_post(proto::TRAY_SHOWN, 1, show_steps_packed());
 }
 
 /// Hide the window (`click_away`: it lost the focus). From now on nothing runs
@@ -621,9 +632,7 @@ impl eframe::App for AudioApp {
             }
         }
         if UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
-            schedule_uncloak(None);
-            cloak(false);
-            tray_post(proto::TRAY_SHOWN, 1, show_steps_packed());
+            on_screen();
         }
 
         if JUST_OPENED.swap(false, Ordering::Relaxed) {
