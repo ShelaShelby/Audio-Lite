@@ -81,6 +81,8 @@ static UNCLOAK_NOW: AtomicBool = AtomicBool::new(false);
 /// The steps of the last show, for the timing of the cycle test: asked,
 /// show_window done, next pass started, frame drawn.
 static SHOW_STEPS: Mutex<[Option<Instant>; 4]> = Mutex::new([None; 4]);
+/// When this process told the tray it is ready.
+static HELLO_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn show_step(i: usize) {
     let mut s = SHOW_STEPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -101,7 +103,10 @@ fn show_steps_packed() -> isize {
     let Some(t0) = s[0] else { return 0 };
     let ms = |t: Option<Instant>| t.map_or(0xffff, |t| t.saturating_duration_since(t0).as_millis().min(0xfffe) as u64);
     let now = Some(Instant::now());
-    (ms(s[1]) | ms(s[2]) << 16 | ms(s[3]) << 32 | ms(now) << 48) as isize
+    // How long after "ready" the request came (a click may wait for the work after it).
+    let hello = *HELLO_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let since_hello = hello.map_or(0xffff, |h| t0.saturating_duration_since(h).as_millis().min(0xfffe) as u64);
+    (ms(s[1]) | since_hello << 16 | ms(s[3]) << 32 | ms(now) << 48) as isize
 }
 /// The tray icon could not be made: the window stays open and its close button quits.
 static NO_TRAY: AtomicBool = AtomicBool::new(false);
@@ -603,9 +608,6 @@ impl AudioApp {
 
 impl eframe::App for AudioApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if AWAIT_FRAME.load(Ordering::Relaxed) {
-            show_step(2);
-        }
         // The close button only hides the window; Quit is in the window.
         if ctx.input(|i| i.viewport().close_requested()) {
             if NO_TRAY.load(Ordering::Relaxed) {
@@ -624,6 +626,7 @@ impl eframe::App for AudioApp {
             }
             cloak(false);
             READY.store(true, Ordering::Relaxed);
+            *HELLO_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             tray_post(proto::TRAY_HELLO, unsafe { GetCurrentProcessId() } as usize, msg_hwnd().0 as isize);
             if with_life(|l| l.visible()).unwrap_or(true) {
                 show_window();
