@@ -393,6 +393,12 @@ fn hide_window(click_away: bool) {
     arm_exit_timer();
 }
 
+/// Tell the tray this process is there: its clicks come straight here from now on.
+fn say_ready() {
+    *HELLO_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    tray_post(proto::TRAY_HELLO, unsafe { GetCurrentProcessId() } as usize, msg_hwnd().0 as isize);
+}
+
 /// What the window shows now, for the next window process to paint at once.
 fn save_cache() {
     let text = model::to_cache(&engine().model());
@@ -503,6 +509,10 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 }
                 Some(Do::Nothing) => LRESULT(proto::OPEN_NOTHING),
             }
+        }
+        proto::WINDOW_READY => {
+            say_ready();
+            LRESULT(0)
         }
         proto::WINDOW_WARM => {
             // The pointer is over the tray icon: a click may come.
@@ -626,11 +636,15 @@ impl eframe::App for AudioApp {
             }
             cloak(false);
             READY.store(true, Ordering::Relaxed);
-            *HELLO_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-            tray_post(proto::TRAY_HELLO, unsafe { GetCurrentProcessId() } as usize, msg_hwnd().0 as isize);
             if with_life(|l| l.visible()).unwrap_or(true) {
+                say_ready();
                 show_window();
             } else {
+                // Warm: tell the tray only once this pass is over (presenting the
+                // hidden frame can take a while), so a click is answered at once.
+                unsafe {
+                    let _ = PostMessageW(msg_hwnd(), proto::WINDOW_READY, WPARAM(0), LPARAM(0));
+                }
                 arm_exit_timer();
             }
         }
