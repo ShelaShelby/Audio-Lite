@@ -894,7 +894,7 @@ struct TestLog {
     /// The last show: ms from the click until the tray read "shown".
     heard_ms: Option<u32>,
     /// The last show inside the window process, ms after it was asked:
-    /// show_window done, next pass, frame drawn, on screen (0xffff: not seen).
+    /// show_window done, (request after ready), frame drawn, on screen (0xffff: not seen).
     steps: Option<[u32; 4]>,
 }
 
@@ -1151,7 +1151,8 @@ fn start_cycle_test(n: u32) {
         report_times("warm: start window process to first painted frame (hidden)", &warm_frame);
         report_times("warm: show request to window on screen", &warm_show);
         report_times("warm: show request until the tray read \"shown\"", &warm_heard);
-        for (what, v) in ["show_window done", "next frame started", "frame drawn", "uncloaked"].iter().zip(&warm_steps)
+        for (what, v) in
+            ["show_window done", "request came after ready", "frame drawn", "uncloaked"].iter().zip(&warm_steps)
         {
             report_times(&format!("warm, inside the window process: {what}"), v);
         }
