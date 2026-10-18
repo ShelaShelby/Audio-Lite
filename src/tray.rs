@@ -595,6 +595,8 @@ unsafe extern "system" fn msg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 if wp.0 == 1 {
                     l.shown += 1;
                     l.show_ms = asked.map(|t| millis(t.elapsed()));
+                    let p = lp.0 as u64;
+                    l.steps = (p != 0).then(|| [0, 16, 32, 48].map(|b| ((p >> b) & 0xffff) as u32));
                 } else {
                     l.hidden += 1;
                 }
@@ -872,10 +874,21 @@ struct TestLog {
     frame_ms: Option<u32>,
     /// The last show: ms from the click to the window on screen.
     show_ms: Option<u32>,
+    /// The last show inside the window process, ms after it was asked:
+    /// show_window done, next pass, frame drawn, on screen (0xffff: not seen).
+    steps: Option<[u32; 4]>,
 }
 
-static TEST: Mutex<TestLog> =
-    Mutex::new(TestLog { started: 0, exited: 0, shown: 0, hidden: 0, ready: 0, frame_ms: None, show_ms: None });
+static TEST: Mutex<TestLog> = Mutex::new(TestLog {
+    started: 0,
+    exited: 0,
+    shown: 0,
+    hidden: 0,
+    ready: 0,
+    frame_ms: None,
+    show_ms: None,
+    steps: None,
+});
 
 fn millis(d: Duration) -> u32 {
     u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
@@ -1008,6 +1021,7 @@ fn start_cycle_test(n: u32) {
         let marks = [n / 4, n / 2, n];
         let mut reused = 0;
         let (mut cold_frame, mut cold_show, mut warm_frame, mut warm_show) = (vec![], vec![], vec![], vec![]);
+        let mut warm_steps: [Vec<u32>; 4] = Default::default();
         for c in 1..=n {
             let warm = c.is_multiple_of(2);
             let before = test_log();
@@ -1035,6 +1049,9 @@ fn start_cycle_test(n: u32) {
                 Some(l) if l.shown > before_click.shown => {
                     if warm {
                         warm_show.extend(l.show_ms);
+                        for (v, x) in warm_steps.iter_mut().zip(l.steps.unwrap_or([0xffff; 4])) {
+                            v.push(x);
+                        }
                     } else {
                         cold_show.extend(l.show_ms);
                         if l.ready > before.ready {
@@ -1111,6 +1128,10 @@ fn start_cycle_test(n: u32) {
         report_times("cold start: click to window on screen", &cold_show);
         report_times("warm: start window process to first painted frame (hidden)", &warm_frame);
         report_times("warm: show request to window on screen", &warm_show);
+        for (what, v) in ["show_window done", "next frame started", "frame drawn", "uncloaked"].iter().zip(&warm_steps)
+        {
+            report_times(&format!("warm, inside the window process: {what}"), v);
+        }
         let growth = match (start, end) {
             (Some(a), Some(b)) => b.0 as f64 / MB - a.0 as f64 / MB,
             _ => f64::INFINITY,
