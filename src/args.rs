@@ -15,6 +15,8 @@ pub struct WindowArgs {
     /// Started while the pointer is over the tray icon: get ready hidden, show
     /// only when asked, and exit if no click comes (see `lifetime::WARM`).
     pub warm: bool,
+    /// CI only: run the Theme panel stress test (`themetest`): clicks per step, idle seconds.
+    pub theme_test: Option<(u32, u64)>,
 }
 
 /// The longest `--linger-ms` taken (a day); more would overflow the exit time.
@@ -54,6 +56,11 @@ pub fn parse(args: &[String]) -> Mode {
             "--linger-ms" => w.linger_ms = it.next().and_then(|v| v.parse().ok()).map(|ms: u64| ms.min(MAX_LINGER_MS)),
             "--cycle-test" => cycle_test = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0),
             "--stress-test" => stress_test = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0),
+            "--theme-test" => {
+                let n = it.next().and_then(|v| v.parse().ok()).filter(|n| *n > 0);
+                let idle = it.next().and_then(|v| v.parse().ok());
+                w.theme_test = n.zip(idle);
+            }
             _ => {}
         }
     }
@@ -78,6 +85,9 @@ pub fn window_args(w: &WindowArgs) -> Vec<String> {
     }
     if w.warm {
         out.push("--warm".to_string());
+    }
+    if let Some((n, idle)) = w.theme_test {
+        out.extend(["--theme-test".to_string(), n.to_string(), idle.to_string()]);
     }
     out
 }
@@ -126,8 +136,14 @@ mod tests {
     #[test]
     fn window_arguments() {
         let m = parse(&v("--window --parent 1234 --at -1910,1050 --linger-ms 500 --no-tray"));
-        let want =
-            WindowArgs { parent: 1234, at: Some((-1910, 1050)), linger_ms: Some(500), no_tray: true, warm: false };
+        let want = WindowArgs {
+            parent: 1234,
+            at: Some((-1910, 1050)),
+            linger_ms: Some(500),
+            no_tray: true,
+            warm: false,
+            theme_test: None,
+        };
         assert_eq!(m, Mode::Window(want));
         let m = parse(&v("--parent 7 --window --at 5"));
         assert_eq!(m, Mode::Window(WindowArgs { parent: 7, ..Default::default() }));
@@ -139,8 +155,23 @@ mod tests {
     fn round_trip() {
         for w in [
             WindowArgs { parent: 1, ..Default::default() },
-            WindowArgs { parent: 99999, at: Some((0, -3)), linger_ms: None, no_tray: false, warm: true },
-            WindowArgs { parent: 42, at: Some((3839, 2159)), linger_ms: Some(1000), no_tray: true, warm: false },
+            WindowArgs {
+                parent: 99999,
+                at: Some((0, -3)),
+                linger_ms: None,
+                no_tray: false,
+                warm: true,
+                theme_test: None,
+            },
+            WindowArgs {
+                parent: 42,
+                at: Some((3839, 2159)),
+                linger_ms: Some(1000),
+                no_tray: true,
+                warm: false,
+                theme_test: None,
+            },
+            WindowArgs { parent: 3, theme_test: Some((2000, 600)), ..Default::default() },
         ] {
             assert_eq!(parse(&window_args(&w)), Mode::Window(w.clone()));
             let line = command_line("C:\\My Tools\\audio-lite.exe", &w);
