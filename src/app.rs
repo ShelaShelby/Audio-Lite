@@ -912,7 +912,8 @@ pub fn run(args: WindowArgs) {
     };
     PREFS.with(|p| *p.borrow_mut() = Some(prefs));
 
-    let theme_path = theme::path_in(exe_dir.as_deref());
+    let theme_path = theme::default_path();
+    theme::move_old_file(exe_dir.map(|d| d.join(theme::FILE_NAME)).as_deref(), theme_path.as_deref());
     let ui_state = ui::UiState::new(theme::Store::open(theme_path.clone()));
 
     let icon = egui::IconData { rgba: icon::rgba(32), width: 32, height: 32 };
