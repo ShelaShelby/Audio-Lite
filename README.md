@@ -83,6 +83,35 @@ device with the hotkey, it shows the new one.
 Point at the tray icon: the tooltip shows the device that plays the sound
 now. If switching went wrong, the tooltip says so on a second line.
 
+## Theme
+
+The small palette button at the top right of the window (under the X)
+opens the Theme panel below the window's content; click it again to close
+it. The panel is always closed when the window opens.
+
+- **Appearance**: Light, Dark (the original look) or AMOLED (pure black,
+  for OLED screens).
+- **Colour**: the accent colour of the sliders, the switch and the
+  selected options: blue, teal, red, pink, green, amber or indigo.
+
+Changes apply at once. If the window would no longer fit above the
+taskbar, it grows upward instead.
+
+The choice is saved in `theme.json` next to the exe:
+
+```json
+{
+  "appearance": "dark",
+  "accent": "blue"
+}
+```
+
+[Brightness Lite](https://github.com/ShelaShelby/brightness-lite) reads and writes the same file, so if both exes are in the same
+folder they share one theme: change it in one, and the other uses it the
+next time its window opens. If the file is missing or broken, Dark + Blue
+is used. The file is only written when you pick something, never read or
+written over the network.
+
 ## Smooth sliders, light on the PC
 
 The sliders move freely; the number next to them is a whole percent. The
