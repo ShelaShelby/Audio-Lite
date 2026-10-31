@@ -117,6 +117,8 @@ struct Tray {
     /// Passed on to the window processes (the cycle test makes them exit sooner).
     linger_ms: Option<u64>,
     testing: bool,
+    /// `--theme-test N IDLE_S`: passed on to the window process, which runs it.
+    theme_test: Option<(u32, u64)>,
     /// The tray icon in screen pixels (left, top, right, bottom), from the last pointer event.
     hover_rect: Option<[i32; 4]>,
     /// The hover timer runs.
@@ -299,6 +301,7 @@ impl Tray {
             linger_ms: self.linger_ms,
             no_tray: self.no_tray && !self.testing,
             warm,
+            theme_test: self.theme_test,
         };
         // The exact path (any character a file name may have), not the text form.
         let exe_w: Vec<u16> = exe_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
@@ -803,6 +806,7 @@ pub fn run(cycle_test: Option<u32>, stress_test: Option<u32>) {
         }
     }
     let testing = cycle_test.is_some() || stress_test.is_some();
+    let theme_test = crate::themetest::arg();
     let tray = Tray {
         settings: read_settings(path.as_ref()).unwrap_or_default(),
         path,
@@ -814,8 +818,10 @@ pub fn run(cycle_test: Option<u32>, stress_test: Option<u32>) {
         enumerator,
         children: Vec::new(),
         no_tray: false,
-        linger_ms: testing.then_some(TEST_LINGER_MS),
+        // The theme test hides the window for a long idle: it must not exit then.
+        linger_ms: if theme_test.is_some() { Some(args::MAX_LINGER_MS) } else { testing.then_some(TEST_LINGER_MS) },
         testing,
+        theme_test,
         hover_rect: None,
         hovering: false,
         show_asked: None,
@@ -834,6 +840,10 @@ pub fn run(cycle_test: Option<u32>, stress_test: Option<u32>) {
     match (cycle_test, stress_test) {
         (Some(n), _) => start_cycle_test(n),
         (None, Some(n)) => start_stress_test(n),
+        // The window process runs the theme test and quits the tray at the end.
+        (None, None) if theme_test.is_some() => {
+            with_tray(|t| t.start_window(None, false));
+        }
         // No tray icon: the window opens at once and stays open.
         (None, None) if no_tray => {
             with_tray(|t| t.start_window(None, false));

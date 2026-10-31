@@ -20,7 +20,7 @@ use crate::place::{self, Area, EDGE};
 use crate::proto::{self, HotkeyStatus};
 use crate::settings::{self, Settings};
 use crate::ui::{self, Action};
-use crate::{autostart, cycle, icon, tray};
+use crate::{autostart, cycle, icon, theme, themetest, tray};
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
@@ -40,10 +40,10 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GetWindowRect,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GetClientRect, GetWindowRect,
     GetWindowThreadProcessId, IsWindowVisible, KillTimer, PostMessageW, RegisterClassW, SendMessageTimeoutW,
     SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, HWND_MESSAGE, HWND_TOPMOST,
-    SMTO_ABORTIFHUNG, SMTO_BLOCK, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
+    SMTO_ABORTIFHUNG, SMTO_BLOCK, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
@@ -303,6 +303,27 @@ fn place_window() {
         let (x, y) = place::place(work_area(), (r.right - r.left, r.bottom - r.top), at);
         if (r.left, r.top) != (x, y) {
             let _ = SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+}
+
+/// Give the window a content height of `h` points and put it in its corner in
+/// the same call, so it never sticks out below the taskbar, not even for one
+/// frame: next to a bottom taskbar it grows upward, next to a top one downward.
+fn resize_window(h: f32, pixels_per_point: f32) {
+    unsafe {
+        let wnd = hwnd();
+        let (mut r, mut client) = (RECT::default(), RECT::default());
+        if GetWindowRect(wnd, &mut r).is_err() || GetClientRect(wnd, &mut client).is_err() {
+            return;
+        }
+        let frame = (r.bottom - r.top) - (client.bottom - client.top);
+        let new_h = (h * pixels_per_point).round() as i32 + frame;
+        let w = r.right - r.left;
+        let at = *AT.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y) = place::place(work_area(), (w, new_h), at);
+        if (r.left, r.top, r.bottom - r.top) != (x, y, new_h) {
+            let _ = SetWindowPos(wnd, None, x, y, w, new_h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
 }
@@ -654,6 +675,8 @@ impl eframe::App for AudioApp {
 
         if JUST_OPENED.swap(false, Ordering::Relaxed) {
             self.ui.reset();
+            // Theme panel closed, theme.json read again (the other app may have changed it).
+            self.ui.on_show(ctx);
             self.armed = false; // focus must be seen again before click-away can hide
             self.last_poll = Some(Instant::now());
         }
@@ -718,6 +741,10 @@ impl eframe::App for AudioApp {
             ui::draw(ui, &mut self.ui, &model, &info)
         })
         .unwrap_or_default();
+        if let Some(h) = self.ui.take_height() {
+            resize_window(h, ui.ctx().pixels_per_point());
+        }
+        themetest::frame_done(ui.ctx(), self.ui.hits, self.ui.expanded(), self.ui.theme());
         for a in actions {
             self.act(a);
         }
@@ -744,10 +771,64 @@ impl eframe::App for AudioApp {
         }
     }
 
-    /// Dark clear colour, so no default white can ever show.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        ui::BG.to_normalized_gamma_f32()
+    /// Only for --theme-test: its clicks come in here, as mouse input.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        themetest::hook(ctx, raw_input);
     }
+
+    /// The theme's background, so no default white (or black) can ever show.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+}
+
+// ---- --theme-test (CI): the Theme panel stress test, in this window process ----
+
+/// Printed to stdout and appended to cycle-test.log in the current folder.
+fn report(line: &str) {
+    use std::io::Write;
+    // Never println!: it panics (and so aborts) if stdout is a closed pipe.
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("cycle-test.log") {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Show or hide as a tray click does (a message to this process's message window).
+fn ask_window(ask: crate::lifetime::Ask) {
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            msg_hwnd(),
+            proto::WINDOW_OPEN,
+            WPARAM(proto::ask_code(ask)),
+            LPARAM(0),
+            SMTO_BLOCK,
+            5000,
+            None,
+        );
+    }
+}
+
+fn start_theme_test(n: u32, idle: u64, theme_path: Option<PathBuf>) {
+    themetest::start(
+        n,
+        idle,
+        theme_path,
+        themetest::Ops {
+            ready: || READY.load(Ordering::Relaxed),
+            show: || ask_window(crate::lifetime::Ask::Show),
+            hide: || ask_window(crate::lifetime::Ask::Hide),
+            hwnd,
+            repaint,
+            report,
+            finish: |code| {
+                tray_post(proto::TRAY_QUIT, code as usize, 0);
+                std::process::exit(code);
+            },
+        },
+    );
 }
 
 /// Only one window process at a time: wait (up to 5 s) for one that is still
@@ -831,6 +912,9 @@ pub fn run(args: WindowArgs) {
     };
     PREFS.with(|p| *p.borrow_mut() = Some(prefs));
 
+    let theme_path = theme::path_in(exe_dir.as_deref());
+    let ui_state = ui::UiState::new(theme::Store::open(theme_path.clone()));
+
     let icon = egui::IconData { rgba: icon::rgba(32), width: 32, height: 32 };
     // No depth, stencil or multisampling buffers: egui needs none of them.
     // Not activated by eframe's own first show: a warm window must never take
@@ -858,6 +942,7 @@ pub fn run(args: WindowArgs) {
         options,
         Box::new(move |cc| {
             ui::apply_theme(&cc.egui_ctx);
+            ui_state.apply(&cc.egui_ctx);
             let _ = CTX.set(cc.egui_ctx.clone());
             if let Ok(h) = cc.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
@@ -866,7 +951,10 @@ pub fn run(args: WindowArgs) {
             }
             // eframe shows the window after its first paint; keep that invisible.
             cloak(true);
-            Ok(Box::new(AudioApp { ui: ui::UiState::default(), armed: false, last_poll: None }))
+            if let Some((n, idle)) = args.theme_test {
+                start_theme_test(n, idle, theme_path);
+            }
+            Ok(Box::new(AudioApp { ui: ui_state, armed: false, last_poll: None }))
         }),
     );
     if let Err(e) = result {

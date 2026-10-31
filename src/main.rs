@@ -19,6 +19,7 @@ mod model;
 mod place;
 mod proto;
 mod settings;
+mod theme;
 mod tooltip;
 mod volume;
 
@@ -30,6 +31,8 @@ mod audio;
 mod autostart;
 #[cfg(windows)]
 mod engine;
+#[cfg(windows)]
+mod themetest;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]

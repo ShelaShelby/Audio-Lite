@@ -5,6 +5,7 @@ target/
 
 # Local files
 settings.json
+theme.json
 *.log
 *.tmp
 .env
